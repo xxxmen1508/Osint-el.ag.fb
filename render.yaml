@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: unified-ai-data-lab
+    runtime: docker
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: ADMIN_PASSWORD
+        sync: false
+      - key: SESSION_SECRET
+        generateValue: true
+      - key: DATA_DIR
+        value: /tmp/unified_data
