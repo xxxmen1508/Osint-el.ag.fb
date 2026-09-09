@@ -87,8 +87,9 @@ def health():
 def home(request: Request):
     rows = db().execute("SELECT * FROM drive_sources ORDER BY id DESC").fetchall()
     return templates.TemplateResponse(
-        "index.html",
-        {
+        request=request,
+        name="index.html",
+        context={
             "request": request,
             "admin": is_admin(request),
             "rows": rows,
