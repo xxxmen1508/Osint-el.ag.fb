@@ -2,53 +2,56 @@
 <!doctype html>
 <html lang="he" dir="rtl">
 <head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Unified AI Data Intelligence Lab</title>
 <style>
-body{font-family:system-ui;margin:0;background:#0b1020;color:#eef2ff}main{max-width:900px;margin:auto;padding:20px}
-.card{background:#151c33;border:1px solid #2b3555;border-radius:16px;padding:18px;margin:14px 0}
-input,button{font:inherit;padding:12px;border-radius:10px;border:1px solid #3a4668}
-input{background:#0d1427;color:white;width:100%;box-sizing:border-box}button{background:#3157d5;color:white;cursor:pointer}
-small{color:#aab4d0}.ok{color:#6ee7b7}.warn{color:#fbbf24}.result{border-top:1px solid #303a59;padding:10px 0}
+body{font-family:Arial,sans-serif;background:#111;color:#eee;margin:0}
+main{max-width:900px;margin:auto;padding:24px}
+.card{background:#1d1d1d;border:1px solid #333;border-radius:14px;padding:18px;margin:14px 0}
+input,button{font-size:16px;padding:11px;border-radius:9px;border:1px solid #555}
+input{background:#111;color:#fff;width:100%;box-sizing:border-box}
+button{cursor:pointer}
+pre{white-space:pre-wrap;overflow:auto}
+.small{color:#aaa;font-size:14px}
 </style>
 </head>
-<body><main>
+<body>
+<main>
 <h1>Unified AI Data Intelligence Lab</h1>
-<p><small>מקור האמת הוא הנתונים בלבד. אין המצאה או השלמת מידע. אם אין תוצאה: <b>לא נמצא</b>.</small></p>
+<p class="small">כלל אפס: המערכת לא ממציאה מידע. אם נתון לא קיים במקור — יוצג "לא נמצא".</p>
 
 {% if not admin %}
-<div class="card"><h2>Admin</h2>
-<form method="post" action="/login"><input name="password" type="password" placeholder="סיסמת Admin" required><br><br><button>כניסה</button></form></div>
+<div class="card">
+<h2>Admin</h2>
+<form method="post" action="/login">
+<input type="password" name="password" placeholder="Admin password" required>
+<br><br><button type="submit">כניסה</button>
+</form>
+</div>
 {% else %}
 <div class="card">
 <form method="post" action="/logout"><button>יציאה</button></form>
 </div>
-<div class="card"><h2>העלאת Dataset</h2>
-<form method="post" action="/upload" enctype="multipart/form-data">
-<input type="file" name="file" required><br><br><button>העלה קובץ</button>
-</form>
-<p><small>ההעלאה מתבצעת בזרימה (streaming) כדי לא לטעון קובץ שלם לזיכרון.</small></p>
-</div>
-<div class="card"><h2>חיפוש</h2>
-<input id="q" placeholder="שם / תעודת זהות / טלפון / כתובת / עיר / שדה..." onkeydown="if(event.key==='Enter')go()">
-<br><br><button onclick="go()">חפש</button><div id="out"></div>
-</div>
-<div class="card"><h2>Datasets</h2>
-{% for d in datasets %}
-<div class="result"><b>{{d.name}}</b><br><small>{{d.size}} bytes · {{d.status}} · SHA-256: {{d.sha256}}</small></div>
-{% else %}<small>עדיין לא הועלו קבצים.</small>{% endfor %}
+
+<div class="card">
+<h2>Google Drive</h2>
+<p>Folder ID: <b>{{ folder or "לא הוגדר" }}</b></p>
+<p>OAuth client: <b>{{ "מוגדר" if oauth_ready else "חסר" }}</b></p>
+<p>Refresh token: <b>{{ "מוגדר" if drive_ready else "חסר" }}</b></p>
+{% if oauth_ready and not drive_ready %}
+<p><a href="/google/login" style="color:#8ab4f8">🔐 התחבר ל-Google Drive</a></p>
+{% endif %}
+<button onclick="listFiles()">בדוק קבצים בתיקייה</button>
+<pre id="out"></pre>
 </div>
 {% endif %}
+</main>
 <script>
-async function go(){
- const q=document.getElementById('q').value, out=document.getElementById('out');
- out.innerHTML='בודק...';
- const r=await fetch('/api/search?q='+encodeURIComponent(q));
- if(!r.ok){out.innerHTML='אין הרשאה';return}
- const j=await r.json();
- if(!j.results.length){out.innerHTML='<p class="warn"><b>לא נמצא</b></p>';return}
- out.innerHTML=j.results.map(x=>`<div class="result"><b>${esc(x.dataset)}</b> · ${esc(x.field)}<br>${esc(x.sample)}<br><small>כמות: ${x.count} · ${esc(x.source)}</small></div>`).join('');
+async function listFiles(){
+ const r=await fetch('/api/drive/files'); const j=await r.json();
+ document.getElementById('out').textContent=JSON.stringify(j,null,2);
 }
-function esc(s){return String(s??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}
 </script>
-</main></body></html>
+</body>
+</html>

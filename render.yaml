@@ -8,6 +8,14 @@ services:
       - key: ADMIN_PASSWORD
         sync: false
       - key: SESSION_SECRET
-        generateValue: true
-      - key: DATA_DIR
-        value: /tmp/unified_data
+        sync: false
+      - key: DRIVE_FOLDER_ID
+        sync: false
+      - key: GOOGLE_CLIENT_ID
+        sync: false
+      - key: GOOGLE_CLIENT_SECRET
+        sync: false
+      - key: GOOGLE_REFRESH_TOKEN
+        sync: false
+      - key: GOOGLE_REDIRECT_URI
+        value: https://osint-el-ag-fb.onrender.com/oauth2callback
