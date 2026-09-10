@@ -229,6 +229,170 @@ def oauth_flow(state=None):
 # HEALTH
 # ============================================================
 
+
+# V7: persistent Admin Review / Import Plan.
+# This table stores only reviewed metadata; it never replaces raw source records.
+try:
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS import_plans (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        file_id TEXT NOT NULL,
+        file_name TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'draft',
+        plan_json TEXT NOT NULL,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+    )
+    """)
+    conn.commit()
+except Exception:
+    pass
+
+
+@app.get("/api/import-plan/{file_id}")
+def get_import_plan(file_id: str, request: Request):
+    """Return the latest reviewed import plan; never invent source data."""
+    require_admin(request)
+
+    row = conn.execute(
+        """
+        SELECT id, file_id, file_name, status, plan_json,
+               created_at, updated_at
+        FROM import_plans
+        WHERE file_id=?
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (file_id,)
+    ).fetchone()
+
+    if not row:
+        return {
+            "ok": True,
+            "status": "not_created",
+            "file_id": file_id,
+            "plan": None
+        }
+
+    return {
+        "ok": True,
+        "status": row[3],
+        "plan_id": row[0],
+        "file_id": row[1],
+        "file_name": row[2],
+        "plan": json.loads(row[4]),
+        "created_at": row[5],
+        "updated_at": row[6]
+    }
+
+
+@app.post("/api/import-plan")
+async def save_import_plan(request: Request):
+    """Validate and save an explicit Admin-reviewed mapping. No import starts."""
+    require_admin(request)
+
+    body = await request.json()
+    file_id = str(body.get("file_id", "")).strip()
+    file_name = str(body.get("file_name", "")).strip()
+    mappings = body.get("mappings")
+
+    if not file_id or not file_name or not isinstance(mappings, list):
+        return JSONResponse(
+            {"ok": False, "error": "נדרש file_id, file_name ו-mappings"},
+            status_code=400
+        )
+
+    # Locate analysis using the project's existing dataset_analysis schema.
+    analysis = conn.execute(
+        """
+        SELECT file_id, name, status, encoding, delimiter,
+               column_count, header_detected
+        FROM dataset_analysis
+        WHERE file_id=?
+        """,
+        (file_id,)
+    ).fetchone()
+
+    if not analysis:
+        return JSONResponse(
+            {"ok": False, "error": "לא נמצאה אנליזה לקובץ. יש לבצע Analyze לפני אישור."},
+            status_code=400
+        )
+
+    normalized = []
+    seen = set()
+
+    allowed = {
+        "ignore", "national_id", "phone", "email", "first_name",
+        "last_name", "name", "address", "city", "location",
+        "location_detail", "birth_date", "birth_year", "gender",
+        "relationship_status", "work", "facebook_id",
+        "external_numeric_id", "identifier", "text"
+    }
+
+    for item in mappings:
+        if not isinstance(item, dict):
+            return JSONResponse({"ok": False, "error": "Mapping לא תקין"}, status_code=400)
+
+        try:
+            idx = int(item.get("column_index"))
+        except Exception:
+            return JSONResponse({"ok": False, "error": "column_index חייב להיות מספר"}, status_code=400)
+
+        meaning = str(item.get("meaning", "")).strip()
+        if idx < 1 or idx > int(analysis[5]):
+            return JSONResponse({"ok": False, "error": f"עמודה מחוץ לטווח: {idx}"}, status_code=400)
+        if idx in seen:
+            return JSONResponse({"ok": False, "error": f"עמודה {idx} מופיעה יותר מפעם אחת"}, status_code=400)
+        if meaning not in allowed:
+            return JSONResponse({"ok": False, "error": f"meaning לא מוכר: {meaning}"}, status_code=400)
+
+        seen.add(idx)
+        normalized.append({
+            "column_index": idx,
+            "meaning": meaning,
+            "approved": bool(item.get("approved", True)),
+            "notes": str(item.get("notes", "")).strip()
+        })
+
+    plan = {
+        "version": 1,
+        "file": {
+            "id": file_id,
+            "name": file_name,
+            "encoding": analysis[3],
+            "delimiter": analysis[4],
+            "column_count": int(analysis[5]),
+            "header_detected": bool(analysis[6])
+        },
+        "mappings": normalized,
+        "import_allowed": True,
+        "created_by": "admin_review"
+    }
+
+    conn.execute(
+        """
+        INSERT INTO import_plans
+            (file_id, file_name, status, plan_json, updated_at)
+        VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+        """,
+        (
+            file_id,
+            file_name,
+            "approved_for_import",
+            json.dumps(plan, ensure_ascii=False)
+        )
+    )
+    conn.commit()
+
+    return {
+        "ok": True,
+        "status": "approved_for_import",
+        "message": "Import Plan נשמר. עדיין לא בוצע Import.",
+        "plan": plan
+    }
+
+
 @app.get("/health")
 def health():
 
@@ -1595,56 +1759,38 @@ def drive_files(request: Request):
 # ANALYZE / DRY RUN
 # ============================================================
 
-def guess_encoding(raw):
-    """
-    Conservative encoding detection.
-    UTF-8 is preferred when it decodes cleanly.
-    Legacy encodings are only selected when UTF-8 is not valid.
-    """
+def guess_encoding(raw: bytes):
+    """Conservative encoding detection; never treats a guess as certainty."""
 
-    def score_text(text):
-        if not text:
+    def score(decoded):
+        if not decoded:
             return -999.0
 
-        total = len(text)
-        replacements = text.count("\ufffd")
-
+        n = len(decoded)
+        replacements = decoded.count("\ufffd")
         controls = sum(
-            1
-            for ch in text
+            1 for ch in decoded
             if ord(ch) < 32 and ch not in "\r\n\t"
         )
 
-        mojibake_markers = [
-            "Ã", "Â", "â", "ð", "×", "Ø", "Ù", "Ú", "�"
-        ]
-
         mojibake = sum(
-            text.count(marker)
-            for marker in mojibake_markers
+            decoded.count(x)
+            for x in ("Ã", "Â", "â", "ð", "×", "Ø", "Ù", "Ú", "�")
         )
 
         printable = sum(
-            1
-            for ch in text
+            1 for ch in decoded
             if ch.isprintable() or ch in "\r\n\t"
         )
 
-        printable_ratio = printable / max(total, 1)
-
-        score = printable_ratio * 100
+        score = printable / max(n, 1) * 100
         score -= replacements * 20
         score -= controls * 5
         score -= mojibake * 0.5
 
-        hebrew = sum(
-            1
-            for ch in text
-            if "\u0590" <= ch <= "\u05FF"
-        )
-
+        hebrew = sum(1 for ch in decoded if "\u0590" <= ch <= "\u05FF")
         if hebrew:
-            score += min(20, hebrew / max(total, 1) * 100)
+            score += min(20, hebrew / max(n, 1) * 100)
 
         return score
 
@@ -1659,26 +1805,22 @@ def guess_encoding(raw):
     ]
 
     best = None
-
     for encoding, confidence in candidates:
         try:
             decoded = raw.decode(encoding, errors="strict")
         except UnicodeDecodeError:
             continue
-
-        score = score_text(decoded)
-
-        if best is None or score > best[0]:
-            best = (score, encoding, confidence)
+        item = (score(decoded), encoding, confidence)
+        if best is None or item[0] > best[0]:
+            best = item
 
     if best is None:
         return "utf-8", "נמוכה"
 
-    score, encoding, confidence = best
-
-    if score < 70:
+    value, encoding, confidence = best
+    if value < 70:
         confidence = "נמוכה"
-    elif score < 90:
+    elif value < 90:
         confidence = "בינונית"
 
     return encoding, confidence
