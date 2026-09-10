@@ -1597,179 +1597,91 @@ def drive_files(request: Request):
 
 def guess_encoding(raw):
     """
-    זיהוי שמרני של encoding.
-
-    חשוב:
-    - UTF-8 מקבל עדיפות כאשר הוא באמת מתאים לנתונים.
-    - נבדקים סימנים של mojibake.
-    - לא מתבצע שינוי של הנתונים המקוריים.
-    - ה-encoding הוא תוצאת ניתוח בלבד.
+    Conservative encoding detection.
+    UTF-8 is preferred when it decodes cleanly.
+    Legacy encodings are only selected when UTF-8 is not valid.
     """
 
-    candidates = [
-        ("utf-8-sig", "strong"),
-        ("utf-8", "strong"),
-        ("cp1255", "medium"),
-        ("windows-1255", "medium"),
-        ("iso-8859-8", "medium"),
-        ("cp1252", "low"),
-        ("latin-1", "low"),
-    ]
-
-    mojibake_markers = [
-        "Ã",
-        "Â",
-        "â€",
-        "â€™",
-        "â€œ",
-        "â€",
-        "×",
-        "Ø",
-        "Ù",
-        "Ð",
-        "Ñ",
-        "�",
-    ]
-
     def score_text(text):
-
         if not text:
-            return -999999
+            return -999.0
 
-        score = 0
+        total = len(text)
+        replacements = text.count("\ufffd")
 
-        replacement_count = text.count(
-            "\ufffd"
+        controls = sum(
+            1
+            for ch in text
+            if ord(ch) < 32 and ch not in "\r\n\t"
         )
 
-        score -= replacement_count * 100
+        mojibake_markers = [
+            "Ã", "Â", "â", "ð", "×", "Ø", "Ù", "Ú", "�"
+        ]
 
-        for marker in mojibake_markers:
-            score -= text.count(marker) * 3
-
-        hebrew_count = len(
-            re.findall(
-                r"[\u0590-\u05FF]",
-                text
-            )
+        mojibake = sum(
+            text.count(marker)
+            for marker in mojibake_markers
         )
 
-        score += min(
-            hebrew_count,
-            500
-        ) * 2
-
-        alnum_count = len(
-            re.findall(
-                r"[A-Za-z0-9]",
-                text
-            )
+        printable = sum(
+            1
+            for ch in text
+            if ch.isprintable() or ch in "\r\n\t"
         )
 
-        score += min(
-            alnum_count,
-            500
+        printable_ratio = printable / max(total, 1)
+
+        score = printable_ratio * 100
+        score -= replacements * 20
+        score -= controls * 5
+        score -= mojibake * 0.5
+
+        hebrew = sum(
+            1
+            for ch in text
+            if "\u0590" <= ch <= "\u05FF"
         )
 
-        control_count = len(
-            re.findall(
-                r"[\x00-\x08\x0B\x0C\x0E-\x1F]",
-                text
-            )
-        )
-
-        score -= control_count * 5
+        if hebrew:
+            score += min(20, hebrew / max(total, 1) * 100)
 
         return score
 
-    successful = []
+    candidates = [
+        ("utf-8-sig", "גבוהה"),
+        ("utf-8", "גבוהה"),
+        ("cp1255", "בינונית"),
+        ("windows-1255", "בינונית"),
+        ("iso-8859-8", "בינונית"),
+        ("cp1252", "נמוכה"),
+        ("latin-1", "נמוכה"),
+    ]
+
+    best = None
 
     for encoding, confidence in candidates:
-
         try:
-
-            text = raw.decode(
-                encoding,
-                errors="strict"
-            )
-
-            replacement_count = text.count(
-                "\ufffd"
-            )
-
-            if replacement_count > 0:
-                continue
-
-            score = score_text(
-                text
-            )
-
-            successful.append({
-                "encoding":
-                    encoding,
-
-                "confidence":
-                    confidence,
-
-                "score":
-                    score,
-
-                "text":
-                    text,
-            })
-
+            decoded = raw.decode(encoding, errors="strict")
         except UnicodeDecodeError:
             continue
 
-    if not successful:
+        score = score_text(decoded)
 
-        return (
-            "utf-8",
-            "low"
-        )
+        if best is None or score > best[0]:
+            best = (score, encoding, confidence)
 
-    successful.sort(
-        key=lambda item:
-            item["score"],
-        reverse=True
-    )
+    if best is None:
+        return "utf-8", "נמוכה"
 
-    best = successful[0]
+    score, encoding, confidence = best
 
-    utf8_candidates = [
-        item
-        for item in successful
-        if item["encoding"]
-        in (
-            "utf-8",
-            "utf-8-sig"
-        )
-    ]
+    if score < 70:
+        confidence = "נמוכה"
+    elif score < 90:
+        confidence = "בינונית"
 
-    if utf8_candidates:
-
-        utf8_best = max(
-            utf8_candidates,
-            key=lambda item:
-                item["score"]
-        )
-
-        if (
-            utf8_best["score"]
-            >=
-            best["score"] - 50
-        ):
-
-            return (
-                utf8_best["encoding"],
-                "strong"
-            )
-
-    return (
-        best["encoding"],
-        best["confidence"]
-    )
-
+    return encoding, confidence
 
 def detect_delimiter(lines):
 
