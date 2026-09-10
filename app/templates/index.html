@@ -38,9 +38,16 @@ pre{white-space:pre-wrap;overflow:auto}
 <h2>Google Drive</h2>
 <p>Folder ID: <b>{{ folder or "לא הוגדר" }}</b></p>
 <p>OAuth client: <b>{{ "מוגדר" if oauth_ready else "חסר" }}</b></p>
-<p>Refresh token: <b>{{ "מוגדר" if drive_ready else "חסר" }}</b></p>
-{% if oauth_ready and not drive_ready %}
+{% if drive_ready %}
+<p><b>Google Drive מחובר</b></p>
+<form method="post" action="/google/disconnect" style="display:inline">
+<button type="submit">התנתק מ-Google Drive</button>
+</form>
+{% else %}
+<p><b>Google Drive לא מחובר</b></p>
+{% if oauth_ready %}
 <p><a href="/google/login" style="color:#8ab4f8">🔐 התחבר ל-Google Drive</a></p>
+{% endif %}
 {% endif %}
 <button onclick="listFiles()">בדוק קבצים בתיקייה</button>
 <pre id="out"></pre>

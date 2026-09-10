@@ -24,6 +24,7 @@ GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "").strip()
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "").strip()
 GOOGLE_REFRESH_TOKEN = os.getenv("GOOGLE_REFRESH_TOKEN", "").strip()
 TOKEN_COOKIE = "unified_ai_drive_token"
+DISABLED_COOKIE = "unified_ai_drive_disabled"
 
 SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 REDIRECT_URI = os.getenv(
@@ -31,7 +32,7 @@ REDIRECT_URI = os.getenv(
     "https://osint-el-ag-fb.onrender.com/oauth2callback",
 )
 
-app = FastAPI(title="Unified AI Data Intelligence Lab V4")
+app = FastAPI(title="Unified AI Data Intelligence Lab V5 OAuth Reconnect")
 app.add_middleware(SessionMiddleware, secret_key=SESSION_SECRET)
 templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 
@@ -63,8 +64,15 @@ def decrypt_refresh_token(value: str) -> str | None:
         return None
 
 def refresh_token_from_request(request: Request) -> str:
-    cookie_token = decrypt_refresh_token(request.cookies.get(TOKEN_COOKIE, ""))
-    return cookie_token or GOOGLE_REFRESH_TOKEN
+    # A Render environment token is legacy configuration only. It must never
+    # make the UI look connected or override an explicit browser disconnect.
+    # Fresh OAuth credentials are stored in the encrypted HttpOnly cookie.
+    if request.cookies.get(DISABLED_COOKIE) == "1":
+        return ""
+    return decrypt_refresh_token(request.cookies.get(TOKEN_COOKIE, "")) or ""
+
+def browser_drive_connected(request: Request) -> bool:
+    return bool(refresh_token_from_request(request))
 
 def credentials_from_request(request: Request):
     refresh = refresh_token_from_request(request)
@@ -99,7 +107,7 @@ def oauth_flow(state=None):
 def health():
     return {
         "ok": True,
-        "version": "v4",
+        "version": "v5-oauth-reconnect",
         "drive_folder_configured": bool(DRIVE_FOLDER_ID),
         "oauth_client_configured": bool(GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET),
         "refresh_token_configured": bool(GOOGLE_REFRESH_TOKEN),
@@ -117,7 +125,8 @@ def home(request: Request):
             "rows": rows,
             "folder": DRIVE_FOLDER_ID,
             "oauth_ready": bool(GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET),
-            "drive_ready": bool(credentials_from_request(request)),
+            "drive_ready": browser_drive_connected(request),
+            "legacy_refresh_configured": bool(GOOGLE_REFRESH_TOKEN),
         },
     )
 
@@ -208,6 +217,7 @@ def oauth2callback(request: Request, code: str = "", state: str = ""):
         samesite="lax",
         path="/",
     )
+    response.delete_cookie(DISABLED_COOKIE, path="/")
     request.session.pop("oauth_state", None)
     request.session.pop("oauth_code_verifier", None)
     request.session["google_drive_connected"] = True
@@ -220,6 +230,17 @@ def google_disconnect(request: Request):
         raise HTTPException(403)
     response = RedirectResponse("/", status_code=303)
     response.delete_cookie(TOKEN_COOKIE, path="/")
+    # Persist the explicit disconnect across Admin logout and new sessions.
+    # This also prevents a stale GOOGLE_REFRESH_TOKEN from being retried.
+    response.set_cookie(
+        DISABLED_COOKIE,
+        "1",
+        max_age=60 * 60 * 24 * 365,
+        httponly=True,
+        secure=True,
+        samesite="lax",
+        path="/",
+    )
     request.session.pop("google_drive_connected", None)
     return response
 
