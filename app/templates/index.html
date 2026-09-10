@@ -1,46 +1,860 @@
 <!doctype html>
 <html lang="he" dir="rtl">
+
 <head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Unified AI Data Intelligence Lab</title>
+
+<meta charset="utf-8">
+
+<meta
+    name="viewport"
+    content="width=device-width,initial-scale=1"
+>
+
+<title>
+Unified AI Data Intelligence Lab
+</title>
+
 <style>
-body{font-family:Arial,sans-serif;background:#111;color:#eee;margin:0}
-main{max-width:1000px;margin:auto;padding:20px}
-.card{background:#1d1d1d;border:1px solid #333;border-radius:14px;padding:18px;margin:14px 0}
-input,button{font-size:16px;padding:11px;border-radius:9px;border:1px solid #555}
-input{background:#111;color:#fff;width:100%;box-sizing:border-box}
-button{cursor:pointer;margin:4px} pre{white-space:pre-wrap;overflow:auto;background:#0b0b0b;padding:12px;border-radius:10px}
-.small{color:#aaa;font-size:14px}.file{border-top:1px solid #333;padding:14px 0}.ok{color:#7ee787}
-</style></head>
-<body><main>
-<h1>Unified AI Data Intelligence Lab</h1>
-<p class="small">כלל אפס: המערכת לא ממציאה מידע. אם נתון לא קיים במקור — יוצג "לא נמצא".</p>
+
+body{
+    font-family:Arial,sans-serif;
+    background:#111;
+    color:#eee;
+    margin:0;
+}
+
+main{
+    max-width:1000px;
+    margin:auto;
+    padding:20px;
+}
+
+.card{
+    background:#1d1d1d;
+    border:1px solid #333;
+    border-radius:14px;
+    padding:18px;
+    margin:14px 0;
+}
+
+input,button{
+    font-size:16px;
+    padding:11px;
+    border-radius:9px;
+    border:1px solid #555;
+}
+
+input{
+    background:#111;
+    color:#fff;
+    width:100%;
+    box-sizing:border-box;
+}
+
+button{
+    cursor:pointer;
+    margin:4px;
+    background:#222;
+    color:#fff;
+}
+
+button:disabled{
+    opacity:.5;
+    cursor:wait;
+}
+
+pre{
+    white-space:pre-wrap;
+    overflow:auto;
+    background:#0b0b0b;
+    padding:12px;
+    border-radius:10px;
+}
+
+.small{
+    color:#aaa;
+    font-size:14px;
+}
+
+.file{
+    border-top:1px solid #333;
+    padding:14px 0;
+}
+
+.ok{
+    color:#7ee787;
+}
+
+.loading{
+    color:#f0c674;
+    font-weight:bold;
+}
+
+.error{
+    color:#ff6b6b;
+    font-weight:bold;
+}
+
+.result-box{
+    margin-top:10px;
+    padding:12px;
+    border-radius:10px;
+    background:#101010;
+}
+
+.status-line{
+    padding:10px;
+    margin:8px 0;
+    border-radius:8px;
+    background:#171717;
+}
+
+</style>
+
+</head>
+
+<body>
+
+<main>
+
+<h1>
+Unified AI Data Intelligence Lab
+</h1>
+
+<p class="small">
+כלל אפס:
+המערכת לא ממציאה מידע.
+אם נתון לא קיים במקור —
+יוצג "לא נמצא".
+</p>
+
+
 {% if not admin %}
-<div class="card"><h2>Admin</h2><form method="post" action="/login">
-<input type="password" name="password" placeholder="Admin password" required><br><br><button type="submit">כניסה</button>
-</form></div>
+
+<div class="card">
+
+<h2>
+Admin
+</h2>
+
+<form method="post" action="/login">
+
+<input
+    type="password"
+    name="password"
+    placeholder="Admin password"
+    required
+>
+
+<br><br>
+
+<button type="submit">
+כניסה
+</button>
+
+</form>
+
+</div>
+
+
 {% else %}
-<div class="card"><form method="post" action="/logout"><button>יציאה</button></form></div>
-<div class="card"><h2>Google Drive</h2>
-<p>Folder ID: <b>{{ folder or "לא הוגדר" }}</b></p>
-<p>OAuth client: <b>{{ "מוגדר" if oauth_ready else "חסר" }}</b></p>
-{% if drive_ready %}<p class="ok"><b>Google Drive מחובר ✓</b></p>
-<form method="post" action="/google/disconnect" style="display:inline"><button type="submit">התנתק מ-Google Drive</button></form>
-{% else %}<p><b>Google Drive לא מחובר</b></p>{% if oauth_ready %}<p><a href="/google/login" style="color:#8ab4f8">🔐 התחבר ל-Google Drive</a></p>{% endif %}{% endif %}
-<br><button onclick="listFiles()">🔄 סרוק את התיקייה</button><button onclick="driveDiagnostics()">🩺 אבחון Drive</button>
-<pre id="out"></pre></div>
-<div class="card"><h2>🔎 Analyze / Dry Run</h2>
-<p class="small">המערכת קוראת רק דגימה קטנה מהקובץ. היא לא מורידה את הקובץ המלא ולא מבצעת עדיין Import או מיזוג.</p>
-<div id="files"></div><pre id="analysis"></pre></div>
+
+
+<div class="card">
+
+<form
+    method="post"
+    action="/logout"
+>
+
+<button type="submit">
+יציאה
+</button>
+
+</form>
+
+</div>
+
+
+<div class="card">
+
+<h2>
+Google Drive
+</h2>
+
+<p>
+Folder ID:
+<b>
+{{ folder or "לא הוגדר" }}
+</b>
+</p>
+
+<p>
+OAuth client:
+<b>
+{{ "מוגדר" if oauth_ready else "חסר" }}
+</b>
+</p>
+
+
+{% if drive_ready %}
+
+<p class="ok">
+<b>
+Google Drive מחובר ✓
+</b>
+</p>
+
+<form
+    method="post"
+    action="/google/disconnect"
+    style="display:inline"
+>
+
+<button type="submit">
+התנתק מ-Google Drive
+</button>
+
+</form>
+
+
+{% else %}
+
+<p>
+<b>
+Google Drive לא מחובר
+</b>
+</p>
+
+{% if oauth_ready %}
+
+<p>
+
+<a
+    href="/google/login"
+    style="color:#8ab4f8"
+>
+🔐 התחבר ל-Google Drive
+</a>
+
+</p>
+
 {% endif %}
+
+{% endif %}
+
+
+<br>
+
+<button
+    id="scanButton"
+    onclick="listFiles()"
+>
+🔄 סרוק את התיקייה
+</button>
+
+
+<button
+    id="diagnosticsButton"
+    onclick="driveDiagnostics()"
+>
+🩺 אבחון Drive
+</button>
+
+
+<div
+    id="driveStatus"
+    class="status-line"
+>
+מוכן.
+</div>
+
+
+<pre id="out"></pre>
+
+</div>
+
+
+<div class="card">
+
+<h2>
+🔎 Analyze / Dry Run
+</h2>
+
+<p class="small">
+
+המערכת קוראת רק דגימה קטנה
+מהקובץ לצורך אבחון.
+
+היא לא מורידה את הקובץ המלא,
+לא מבצעת Import,
+ולא מבצעת מיזוג.
+
+</p>
+
+
+<div id="files"></div>
+
+
+<div
+    id="analysisStatus"
+    class="status-line"
+>
+עדיין לא נותח קובץ.
+</div>
+
+
+<pre id="analysis"></pre>
+
+</div>
+
+
+{% endif %}
+
 </main>
+
+
 <script>
-function show(id,obj){document.getElementById(id).textContent=JSON.stringify(obj,null,2)}
-async function listFiles(){const r=await fetch('/api/drive/files');const j=await r.json();show('out',j);renderFiles(j)}
-function renderFiles(j){const box=document.getElementById('files');box.innerHTML='';if(!j.files)return;
-j.files.forEach(f=>{const div=document.createElement('div');div.className='file';const mb=f.size?(Number(f.size)/1024/1024).toFixed(1)+' MB':'גודל לא ידוע';
-div.innerHTML='<b>'+escapeHtml(f.name)+'</b> — '+mb+'<br><span class="small">'+escapeHtml(f.path||'')+'</span> <button onclick="analyzeFile('+JSON.stringify(f.id)+')">נתח קובץ</button>';box.appendChild(div)})}
-async function analyzeFile(id){document.getElementById('analysis').textContent='מנתח דגימה מהקובץ...';const r=await fetch('/api/drive/analyze/'+encodeURIComponent(id));const j=await r.json();show('analysis',j)}
-async function driveDiagnostics(){const r=await fetch('/api/drive/diagnostics');const j=await r.json();show('out',j)}
-function escapeHtml(s){return String(s||'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}
-</script></body></html>
+
+
+function show(id, obj){
+
+    const element =
+        document.getElementById(id);
+
+    element.textContent =
+        JSON.stringify(
+            obj,
+            null,
+            2
+        );
+}
+
+
+function setStatus(
+    id,
+    text,
+    type=""
+){
+
+    const element =
+        document.getElementById(id);
+
+    element.textContent =
+        text;
+
+    element.className =
+        "status-line " + type;
+}
+
+
+async function listFiles(){
+
+    const button =
+        document.getElementById(
+            "scanButton"
+        );
+
+    button.disabled = true;
+
+    setStatus(
+        "driveStatus",
+        "⏳ סורק את Google Drive...",
+        "loading"
+    );
+
+    try{
+
+        const response =
+            await fetch(
+                "/api/drive/files",
+                {
+                    cache:"no-store"
+                }
+            );
+
+        const text =
+            await response.text();
+
+        let data;
+
+        try{
+            data = JSON.parse(text);
+        }
+        catch{
+            throw new Error(
+                "השרת החזיר תשובה שאינה JSON: "
+                + text.slice(0,500)
+            );
+        }
+
+        show(
+            "out",
+            data
+        );
+
+        if(!response.ok || !data.ok){
+
+            setStatus(
+                "driveStatus",
+                "❌ הסריקה נכשלה",
+                "error"
+            );
+
+            return;
+        }
+
+        renderFiles(data);
+
+        setStatus(
+            "driveStatus",
+            "✅ הסריקה הסתיימה. נמצאו "
+            + (data.files || []).length
+            + " קבצים.",
+            "ok"
+        );
+
+    }
+    catch(error){
+
+        setStatus(
+            "driveStatus",
+            "❌ שגיאה: " + error.message,
+            "error"
+        );
+
+        document.getElementById(
+            "out"
+        ).textContent =
+            error.stack || error.message;
+
+    }
+    finally{
+
+        button.disabled = false;
+
+    }
+}
+
+
+function renderFiles(data){
+
+    const box =
+        document.getElementById(
+            "files"
+        );
+
+    box.innerHTML = "";
+
+    if(
+        !data.files
+        ||
+        !data.files.length
+    ){
+
+        box.innerHTML =
+            "<p>לא נמצאו קבצים.</p>";
+
+        return;
+    }
+
+
+    data.files.forEach(
+        function(file){
+
+            const div =
+                document.createElement(
+                    "div"
+                );
+
+            div.className =
+                "file";
+
+
+            const mb =
+                file.size
+                ?
+                (
+                    Number(file.size)
+                    /
+                    1024
+                    /
+                    1024
+                ).toFixed(1)
+                + " MB"
+                :
+                "גודל לא ידוע";
+
+
+            const name =
+                escapeHtml(
+                    file.name
+                );
+
+
+            const path =
+                escapeHtml(
+                    file.path || ""
+                );
+
+
+            div.innerHTML =
+
+                "<b>"
+                + name
+                + "</b>"
+                + " — "
+                + mb
+                + "<br>"
+                +
+
+                "<span class='small'>"
+                + path
+                + "</span>"
+                +
+
+                "<br>"
+
+                +
+
+                "<button "
+                + "type='button' "
+                + "class='analyze-button' "
+                + "data-file-id='"
+                + escapeHtml(file.id)
+                + "'>"
+                + "🔎 נתח קובץ"
+                + "</button>";
+
+
+            const analyzeButton =
+                div.querySelector(
+                    ".analyze-button"
+                );
+
+
+            analyzeButton.addEventListener(
+                "click",
+                function(){
+
+                    analyzeFile(
+                        file.id,
+                        analyzeButton
+                    );
+
+                }
+            );
+
+
+            box.appendChild(
+                div
+            );
+
+        }
+    );
+}
+
+
+async function analyzeFile(
+    id,
+    button
+){
+
+    const status =
+        document.getElementById(
+            "analysisStatus"
+        );
+
+    const output =
+        document.getElementById(
+            "analysis"
+        );
+
+
+    button.disabled = true;
+
+    const oldText =
+        button.textContent;
+
+    button.textContent =
+        "⏳ מנתח...";
+
+
+    output.textContent =
+        "";
+
+
+    setStatus(
+        "analysisStatus",
+        "⏳ מתחיל Analyze / Dry Run..."
+        + "\n"
+        + "קורא דגימה בלבד מהקובץ."
+        + "\n"
+        + "הקובץ המלא לא אמור לרדת.",
+        "loading"
+    );
+
+
+    const started =
+        Date.now();
+
+
+    try{
+
+        const response =
+            await fetch(
+                "/api/drive/analyze/"
+                + encodeURIComponent(id)
+                + "?_="
+                + Date.now(),
+                {
+                    method:"GET",
+                    cache:"no-store"
+                }
+            );
+
+
+        const text =
+            await response.text();
+
+
+        let data;
+
+
+        try{
+
+            data =
+                JSON.parse(text);
+
+        }
+        catch{
+
+            throw new Error(
+                "השרת החזיר תשובה שאינה JSON:"
+                + "\n"
+                + text.slice(0,1000)
+            );
+
+        }
+
+
+        show(
+            "analysis",
+            data
+        );
+
+
+        const seconds =
+            (
+                (Date.now() - started)
+                / 1000
+            ).toFixed(1);
+
+
+        if(
+            !response.ok
+            ||
+            !data.ok
+        ){
+
+            setStatus(
+                "analysisStatus",
+                "❌ Analyze נכשל אחרי "
+                + seconds
+                + " שניות."
+                + "\n"
+                + (
+                    data.error
+                    ||
+                    data.message
+                    ||
+                    "שגיאה לא ידועה"
+                ),
+                "error"
+            );
+
+            return;
+        }
+
+
+        setStatus(
+            "analysisStatus",
+            "✅ Analyze הסתיים בהצלחה תוך "
+            + seconds
+            + " שניות."
+            + "\n"
+            + "נקראו "
+            + (
+                data.sample_bytes_read
+                || 0
+            )
+            + " bytes בלבד."
+            + "\n"
+            + "full_file_downloaded = "
+            + data.full_file_downloaded,
+            "ok"
+        );
+
+
+    }
+    catch(error){
+
+        setStatus(
+            "analysisStatus",
+            "❌ Analyze לא הצליח להתחיל/להסתיים."
+            + "\n"
+            + error.message,
+            "error"
+        );
+
+
+        output.textContent =
+            error.stack
+            ||
+            error.message;
+
+    }
+    finally{
+
+        button.disabled = false;
+
+        button.textContent =
+            oldText;
+
+    }
+}
+
+
+async function driveDiagnostics(){
+
+    const button =
+        document.getElementById(
+            "diagnosticsButton"
+        );
+
+
+    button.disabled = true;
+
+
+    setStatus(
+        "driveStatus",
+        "⏳ מריץ אבחון Drive...",
+        "loading"
+    );
+
+
+    try{
+
+        const response =
+            await fetch(
+                "/api/drive/diagnostics"
+                + "?_="
+                + Date.now(),
+                {
+                    cache:"no-store"
+                }
+            );
+
+
+        const text =
+            await response.text();
+
+
+        let data;
+
+
+        try{
+            data =
+                JSON.parse(text);
+        }
+        catch{
+            throw new Error(
+                "השרת החזיר תשובה שאינה JSON."
+            );
+        }
+
+
+        show(
+            "out",
+            data
+        );
+
+
+        if(
+            !response.ok
+            ||
+            !data.ok
+        ){
+
+            setStatus(
+                "driveStatus",
+                "❌ אבחון Drive נכשל.",
+                "error"
+            );
+
+            return;
+        }
+
+
+        setStatus(
+            "driveStatus",
+            "✅ אבחון Drive הסתיים.",
+            "ok"
+        );
+
+
+    }
+    catch(error){
+
+        setStatus(
+            "driveStatus",
+            "❌ שגיאה באבחון: "
+            + error.message,
+            "error"
+        );
+
+    }
+    finally{
+
+        button.disabled = false;
+
+    }
+}
+
+
+function escapeHtml(value){
+
+    return String(
+        value || ""
+    ).replace(
+        /[&<>"']/g,
+        function(match){
+
+            return {
+                "&":
+                    "&amp;",
+
+                "<":
+                    "&lt;",
+
+                ">":
+                    "&gt;",
+
+                '"':
+                    "&quot;",
+
+                "'":
+                    "&#39;"
+            }[match];
+
+        }
+    );
+
+}
+
+
+</script>
+
+</body>
+
+</html>
