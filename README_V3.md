@@ -1,19 +1,16 @@
-# Unified AI Data Intelligence Lab V3
+# V4 – Google Drive automatic reconnect
 
-V3 adds the first real Google Drive OAuth connection.
+This version keeps the existing OAuth client and PKCE flow, but after successful Google authorization it stores the returned refresh token automatically in an encrypted, Secure, HttpOnly cookie. The token is never rendered into the page or written to logs.
 
-Important:
-- Never put Google Client Secret or Refresh Token in GitHub.
-- Add secrets only in Render Environment Variables.
-- Current V3 only verifies/list files in the configured Drive folder.
-- It does NOT yet index the large datasets; that is the next stage.
-- The zero-hallucination rule is preserved.
+The `GOOGLE_REFRESH_TOKEN` environment variable remains as a fallback for existing deployments. A successful new authorization takes precedence over the old environment token.
 
-Render environment:
-ADMIN_PASSWORD
-SESSION_SECRET
-DRIVE_FOLDER_ID
-GOOGLE_CLIENT_ID
-GOOGLE_CLIENT_SECRET
-GOOGLE_REFRESH_TOKEN
-GOOGLE_REDIRECT_URI=https://osint-el-ag-fb.onrender.com/oauth2callback
+## Deploy
+1. Replace the repository files with this ZIP and commit.
+2. Render: Deploy latest commit.
+3. Admin → Connect Google Drive.
+4. Approve Google access.
+5. Return to the site; no token copy/paste is required.
+6. Click the folder file check.
+
+## Important
+Keep `SESSION_SECRET` stable. The encrypted cookie is derived from it; changing it invalidates the stored browser-side connection and requires reconnecting Google Drive.
