@@ -11,6 +11,7 @@ from starlette.middleware.sessions import SessionMiddleware
 from google_auth_oauthlib.flow import Flow
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
+from cryptography.fernet import Fernet, InvalidToken
 
 DATA_DIR = Path(os.getenv("DATA_DIR", "/tmp/unified_ai_lab"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -22,6 +23,7 @@ DRIVE_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID", "").strip()
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "").strip()
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "").strip()
 GOOGLE_REFRESH_TOKEN = os.getenv("GOOGLE_REFRESH_TOKEN", "").strip()
+TOKEN_COOKIE = "unified_ai_drive_token"
 
 SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 REDIRECT_URI = os.getenv(
@@ -45,12 +47,32 @@ def db():
 def is_admin(r: Request):
     return r.session.get("admin") is True
 
-def credentials_from_env():
-    if not (GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET and GOOGLE_REFRESH_TOKEN):
+def token_fernet():
+    key = base64.urlsafe_b64encode(hashlib.sha256(SESSION_SECRET.encode("utf-8")).digest())
+    return Fernet(key)
+
+def encrypt_refresh_token(token: str) -> str:
+    return token_fernet().encrypt(token.encode("utf-8")).decode("ascii")
+
+def decrypt_refresh_token(value: str) -> str | None:
+    if not value:
+        return None
+    try:
+        return token_fernet().decrypt(value.encode("ascii")).decode("utf-8")
+    except (InvalidToken, ValueError, TypeError):
+        return None
+
+def refresh_token_from_request(request: Request) -> str:
+    cookie_token = decrypt_refresh_token(request.cookies.get(TOKEN_COOKIE, ""))
+    return cookie_token or GOOGLE_REFRESH_TOKEN
+
+def credentials_from_request(request: Request):
+    refresh = refresh_token_from_request(request)
+    if not (GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET and refresh):
         return None
     return Credentials(
         token=None,
-        refresh_token=GOOGLE_REFRESH_TOKEN,
+        refresh_token=refresh,
         token_uri="https://oauth2.googleapis.com/token",
         client_id=GOOGLE_CLIENT_ID,
         client_secret=GOOGLE_CLIENT_SECRET,
@@ -95,7 +117,7 @@ def home(request: Request):
             "rows": rows,
             "folder": DRIVE_FOLDER_ID,
             "oauth_ready": bool(GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET),
-            "drive_ready": bool(credentials_from_env()),
+            "drive_ready": bool(credentials_from_request(request)),
         },
     )
 
@@ -170,18 +192,36 @@ def oauth2callback(request: Request, code: str = "", state: str = ""):
 
     creds = flow.credentials
     refresh = creds.refresh_token or ""
-    # The refresh token is intentionally not sent to the server logs.
-    safe = refresh.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-    return HTMLResponse(f"""
-    <!doctype html><html lang="he" dir="rtl"><meta charset="utf-8">
-    <body style="font-family:Arial;max-width:760px;margin:40px auto;padding:20px">
-      <h2>החיבור ל-Google הצליח ✅</h2>
-      <p>קיבלת Refresh Token. זה סוד אבטחה — <b>אל תשלח אותו אליי ואל תעלה אותו ל-GitHub.</b></p>
-      <p>העתק אותו ישירות ל-Render Environment בשם:</p>
-      <pre style="white-space:pre-wrap;background:#eee;padding:12px">{safe}</pre>
-      <p>לאחר שהוספת אותו ל-Render, בצע Deploy מחדש.</p>
-    </body></html>
-    """)
+    if not refresh:
+        return HTMLResponse(
+            "<h2>Google OAuth הצליח, אבל Google לא החזיר Refresh Token חדש.</h2>"
+            "<p>לחץ על חיבור מחדש ונסה שוב.</p>", status_code=400
+        )
+
+    response = RedirectResponse("/", status_code=303)
+    response.set_cookie(
+        TOKEN_COOKIE,
+        encrypt_refresh_token(refresh),
+        max_age=60 * 60 * 24 * 180,
+        httponly=True,
+        secure=True,
+        samesite="lax",
+        path="/",
+    )
+    request.session.pop("oauth_state", None)
+    request.session.pop("oauth_code_verifier", None)
+    request.session["google_drive_connected"] = True
+    return response
+
+
+@app.post("/google/disconnect")
+def google_disconnect(request: Request):
+    if not is_admin(request):
+        raise HTTPException(403)
+    response = RedirectResponse("/", status_code=303)
+    response.delete_cookie(TOKEN_COOKIE, path="/")
+    request.session.pop("google_drive_connected", None)
+    return response
 
 @app.get("/api/drive/files")
 def drive_files(request: Request):
@@ -189,7 +229,7 @@ def drive_files(request: Request):
         raise HTTPException(403)
     if not DRIVE_FOLDER_ID:
         return JSONResponse({"ok": False, "message": "DRIVE_FOLDER_ID חסר"}, status_code=400)
-    creds = credentials_from_env()
+    creds = credentials_from_request(request)
     if not creds:
         return JSONResponse({"ok": False, "message": "Google OAuth עדיין לא מחובר"}, status_code=400)
 
