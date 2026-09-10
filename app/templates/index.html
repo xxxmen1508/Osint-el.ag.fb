@@ -855,6 +855,168 @@ function escapeHtml(value){
 
 </script>
 
+
+<section id="v7-admin-review" style="margin-top:24px;padding:18px;border:1px solid #555;border-radius:12px">
+  <h2>Admin Review — אישור מיפוי לפני Import</h2>
+  <p>
+    כאן מאשרים במפורש את משמעות העמודות. שום Import לא מתחיל מהמסך הזה.
+  </p>
+
+  <div style="display:flex;gap:8px;flex-wrap:wrap">
+    <input id="v7-file-id" placeholder="File ID" style="min-width:330px">
+    <input id="v7-file-name" placeholder="שם הקובץ" style="min-width:220px">
+    <button onclick="v7LoadAnalyze()">טען תוצאות Analyze</button>
+  </div>
+
+  <div id="v7-status" style="margin-top:12px"></div>
+  <div id="v7-review-table" style="overflow:auto;margin-top:12px"></div>
+
+  <button id="v7-save-plan" onclick="v7SavePlan()" style="display:none;margin-top:12px">
+    ✅ אשר מיפוי ושמור Import Plan
+  </button>
+</section>
+
+<script>
+const V7_OPTIONS = [
+  ["ignore","התעלם"],
+  ["national_id","תעודת זהות"],
+  ["phone","טלפון"],
+  ["email","אימייל"],
+  ["first_name","שם פרטי"],
+  ["last_name","שם משפחה"],
+  ["name","שם מלא"],
+  ["address","כתובת"],
+  ["city","עיר / יישוב"],
+  ["location","מיקום"],
+  ["location_detail","מיקום מפורט"],
+  ["birth_date","תאריך לידה"],
+  ["birth_year","שנת לידה"],
+  ["gender","מגדר"],
+  ["relationship_status","מצב זוגי"],
+  ["work","עבודה / מקצוע"],
+  ["facebook_id","Facebook ID"],
+  ["external_numeric_id","מזהה חיצוני"],
+  ["identifier","מזהה"],
+  ["text","טקסט"]
+];
+
+let v7Data = null;
+
+function v7Esc(v) {
+  return String(v ?? "").replace(/[&<>"']/g, x => ({
+    "&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"
+  }[x]));
+}
+
+async function v7LoadAnalyze() {
+  const id = document.getElementById("v7-file-id").value.trim();
+  const status = document.getElementById("v7-status");
+  const table = document.getElementById("v7-review-table");
+  const save = document.getElementById("v7-save-plan");
+
+  save.style.display = "none";
+  table.innerHTML = "";
+
+  if (!id) {
+    status.textContent = "יש להזין File ID.";
+    return;
+  }
+
+  status.textContent = "טוען נתוני Analyze...";
+
+  // Existing project endpoint is /api/status; use its returned analysis if available.
+  try {
+    const r = await fetch("/api/status");
+    const data = await r.json();
+
+    let analysis = null;
+    if (Array.isArray(data.analyses)) {
+      analysis = data.analyses.find(x => String(x.file_id) === id || String(x.id) === id);
+    }
+    if (!analysis && data.analysis && String(data.analysis.file_id || data.analysis.id) === id) {
+      analysis = data.analysis;
+    }
+
+    if (!analysis) {
+      status.textContent = "לא נמצא — לא נמצאה תוצאת Analyze זמינה דרך /api/status.";
+      return;
+    }
+
+    v7Data = analysis;
+    v7RenderAnalysis(analysis);
+    save.style.display = "inline-block";
+    status.textContent = "תוצאות Analyze נטענו. בדוק ואשר כל עמודה לפני Import.";
+  } catch (e) {
+    status.textContent = "שגיאה בטעינת Analyze: " + e.message;
+  }
+}
+
+function v7RenderAnalysis(a) {
+  const cols = a.columns || [];
+  const table = document.getElementById("v7-review-table");
+
+  let out = "<table style='width:100%;border-collapse:collapse'>";
+  out += "<tr><th>עמודה</th><th>סוג</th><th>הצעת המערכת</th><th>ביטחון</th><th>דוגמאות</th><th>אישור Admin</th></tr>";
+
+  cols.forEach((c, i) => {
+    const candidates = c.semantic_candidates || [];
+    const first = candidates[0] || {};
+    const selected = first.meaning || "ignore";
+
+    let opts = V7_OPTIONS.map(o =>
+      "<option value='" + v7Esc(o[0]) + "'" +
+      (o[0] === selected ? " selected" : "") + ">" +
+      v7Esc(o[1]) + "</option>"
+    ).join("");
+
+    const examples = (c.examples || []).slice(0, 5).map(v7Esc).join(" | ");
+
+    out += "<tr>";
+    out += "<td>" + v7Esc(c.index ?? (i+1)) + "</td>";
+    out += "<td>" + v7Esc(c.inferred_type) + "</td>";
+    out += "<td>" + v7Esc(first.meaning || "לא נקבע") + "</td>";
+    out += "<td>" + v7Esc(first.confidence || "לא נקבע") + "</td>";
+    out += "<td>" + examples + "</td>";
+    out += "<td><select data-v7-col='" + v7Esc(c.index ?? (i+1)) + "'>" + opts + "</select></td>";
+    out += "</tr>";
+  });
+
+  out += "</table>";
+  table.innerHTML = out;
+}
+
+async function v7SavePlan() {
+  if (!v7Data) return;
+
+  const fileId = document.getElementById("v7-file-id").value.trim();
+  const fileName = document.getElementById("v7-file-name").value.trim() ||
+                   v7Data.name || v7Data.file_name || "unknown";
+
+  const mappings = [...document.querySelectorAll("[data-v7-col]")].map(el => ({
+    column_index: Number(el.dataset.v7Col),
+    meaning: el.value,
+    approved: true,
+    notes: ""
+  }));
+
+  const r = await fetch("/api/import-plan", {
+    method: "POST",
+    headers: {"Content-Type":"application/json"},
+    body: JSON.stringify({
+      file_id: fileId,
+      file_name: fileName,
+      mappings
+    })
+  });
+
+  const data = await r.json();
+  document.getElementById("v7-status").textContent =
+    data.ok
+      ? "✅ Import Plan נשמר. עדיין לא בוצע Import."
+      : "❌ " + (data.error || "לא נמצא");
+}
+</script>
+
 </body>
 
 </html>
