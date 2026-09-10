@@ -255,6 +255,157 @@ def google_disconnect(request: Request):
     request.session.pop("google_drive_connected", None)
     return response
 
+def safe_drive_error(error):
+    """Return API diagnostics without credentials, tokens, or client secrets."""
+    import html
+    text = str(error)
+    for secret in (GOOGLE_CLIENT_SECRET, GOOGLE_REFRESH_TOKEN):
+        if secret:
+            text = text.replace(secret, "[REDACTED]")
+    return {
+        "error_type": type(error).__name__,
+        "error": html.escape(text),
+    }
+
+def drive_item_summary(item):
+    return {
+        "id": item.get("id"),
+        "name": item.get("name"),
+        "mimeType": item.get("mimeType"),
+        "size": item.get("size"),
+        "modifiedTime": item.get("modifiedTime"),
+        "parents": item.get("parents", []),
+        "driveId": item.get("driveId"),
+        "trashed": item.get("trashed"),
+    }
+
+@app.get("/api/drive/diagnostics")
+def drive_diagnostics(request: Request):
+    """Diagnose Drive visibility using the exact credential already in session."""
+    if not is_admin(request):
+        raise HTTPException(403)
+    if not DRIVE_FOLDER_ID:
+        return JSONResponse({"ok": False, "message": "DRIVE_FOLDER_ID חסר"}, status_code=400)
+    creds = credentials_from_request(request)
+    if not creds:
+        return JSONResponse({"ok": False, "message": "Google OAuth עדיין לא מחובר"}, status_code=400)
+
+    try:
+        from google.auth.transport.requests import Request as GoogleRequest
+        if not creds.valid:
+            creds.refresh(GoogleRequest())
+        service = build("drive", "v3", credentials=creds, cache_discovery=False)
+    except Exception as e:
+        return JSONResponse({"ok": False, "stage": "token_refresh", **safe_drive_error(e)}, status_code=400)
+
+    result = {
+        "ok": True,
+        "stage": "diagnostics",
+        "credential_source": "encrypted_browser_cookie",
+        "account": None,
+        "folder": None,
+        "folder_check": None,
+        "parent_query": None,
+        "user_corpus_query": None,
+        "shared_drive_query": None,
+        "interpretation": [],
+    }
+
+    try:
+        about = service.about().get(fields="user(displayName,emailAddress,permissionId)").execute()
+        user = about.get("user") or {}
+        result["account"] = {
+            "displayName": user.get("displayName"),
+            "emailAddress": user.get("emailAddress"),
+            "permissionId": user.get("permissionId"),
+        }
+    except Exception as e:
+        result["account"] = {"ok": False, **safe_drive_error(e)}
+
+    item_fields = "id,name,mimeType,size,modifiedTime,webViewLink,driveId,parents,trashed"
+    try:
+        folder = service.files().get(
+            fileId=DRIVE_FOLDER_ID,
+            fields=f"{item_fields},capabilities(canListChildren)",
+            supportsAllDrives=True,
+        ).execute()
+        folder_drive_id = folder.get("driveId")
+        result["folder"] = drive_item_summary(folder)
+        result["folder"].update({
+            "capabilities": folder.get("capabilities", {}),
+            "isFolder": folder.get("mimeType") == "application/vnd.google-apps.folder",
+            "location": "shared_drive" if folder_drive_id else "my_drive_or_shared_folder",
+        })
+        result["folder_check"] = {
+            "ok": True,
+            "canListChildren": (folder.get("capabilities") or {}).get("canListChildren"),
+            "driveId": folder_drive_id,
+        }
+    except Exception as e:
+        result["folder_check"] = {"ok": False, **safe_drive_error(e)}
+        result["ok"] = False
+        return JSONResponse(result, status_code=400)
+
+    def run_list(label, **kwargs):
+        options = {
+            "spaces": "drive",
+            "fields": f"nextPageToken,files({item_fields})",
+            "pageSize": 20,
+            "includeItemsFromAllDrives": True,
+            "supportsAllDrives": True,
+        }
+        options.update(kwargs)
+        try:
+            response = service.files().list(**options).execute()
+            items = response.get("files", [])
+            return {
+                "ok": True,
+                "label": label,
+                "options": {key: value for key, value in options.items() if key not in {"fields"}},
+                "count": len(items),
+                "hasNextPage": bool(response.get("nextPageToken")),
+                "items": [drive_item_summary(item) for item in items],
+            }
+        except Exception as e:
+            return {"ok": False, "label": label, **safe_drive_error(e)}
+
+    result["parent_query"] = run_list(
+        "configured_folder_children",
+        q=f"'{DRIVE_FOLDER_ID}' in parents and trashed = false",
+    )
+    result["user_corpus_query"] = run_list(
+        "user_corpus_without_parent_filter",
+        q="trashed = false",
+        corpora="user",
+    )
+    if result["folder"].get("driveId"):
+        result["shared_drive_query"] = run_list(
+            "shared_drive_root_sample",
+            q="trashed = false",
+            corpora="drive",
+            driveId=result["folder"]["driveId"],
+        )
+    else:
+        result["shared_drive_query"] = {
+            "ok": True,
+            "skipped": True,
+            "reason": "folder metadata has no driveId",
+        }
+
+    parent_count = (result["parent_query"] or {}).get("count", 0)
+    user_count = (result["user_corpus_query"] or {}).get("count", 0)
+    if parent_count == 0 and user_count == 0:
+        result["interpretation"].append("The credential can read folder metadata but user-corpus listing returned no visible items in the sample.")
+    elif parent_count == 0 and user_count > 0:
+        result["interpretation"].append("The account can see Drive items, but none are directly children of the configured folder ID.")
+    elif parent_count > 0:
+        result["interpretation"].append("The account can list direct children of the configured folder; recursive discovery can traverse them.")
+    if result["folder"].get("driveId"):
+        result["interpretation"].append("The configured folder is in a Shared Drive; driveId/corpora=drive results should be checked.")
+    else:
+        result["interpretation"].append("The folder metadata has no driveId; it appears to be in My Drive or a shared folder, not a Shared Drive root.")
+    return result
+
 @app.get("/api/drive/files")
 def drive_files(request: Request):
     if not is_admin(request):

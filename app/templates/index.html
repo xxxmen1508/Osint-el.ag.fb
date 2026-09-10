@@ -50,6 +50,7 @@ pre{white-space:pre-wrap;overflow:auto}
 {% endif %}
 {% endif %}
 <button onclick="listFiles()">בדוק קבצים בתיקייה</button>
+<button onclick="driveDiagnostics()">אבחון נראות Google Drive</button>
 <pre id="out"></pre>
 </div>
 {% endif %}
@@ -57,6 +58,10 @@ pre{white-space:pre-wrap;overflow:auto}
 <script>
 async function listFiles(){
  const r=await fetch('/api/drive/files'); const j=await r.json();
+ document.getElementById('out').textContent=JSON.stringify(j,null,2);
+}
+async function driveDiagnostics(){
+ const r=await fetch('/api/drive/diagnostics'); const j=await r.json();
  document.getElementById('out').textContent=JSON.stringify(j,null,2);
 }
 </script>
