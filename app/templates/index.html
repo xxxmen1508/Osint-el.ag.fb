@@ -933,6 +933,12 @@ async function v7LoadAnalyze() {
     }
     const analysis = data.analysis;
     analysis.columns = analysis.columns || [];
+    // Keep the loaded analysis in memory so the Save button has data to submit.
+    v7Data = analysis;
+
+    if (!document.getElementById("v7-file-name").value.trim()) {
+      document.getElementById("v7-file-name").value = analysis.name || analysis.file_name || "";
+    }
 
     v7RenderAnalysis(analysis);
     save.style.display = "inline-block";
@@ -977,7 +983,11 @@ function v7RenderAnalysis(a) {
 }
 
 async function v7SavePlan() {
-  if (!v7Data) return;
+  const status = document.getElementById("v7-status");
+  if (!v7Data) {
+    status.textContent = "❌ טען קודם תוצאות Analyze.";
+    return;
+  }
 
   const fileId = document.getElementById("v7-file-id").value.trim();
   const fileName = document.getElementById("v7-file-name").value.trim() ||
@@ -990,21 +1000,30 @@ async function v7SavePlan() {
     notes: ""
   }));
 
-  const r = await fetch("/api/import-plan", {
-    method: "POST",
-    headers: {"Content-Type":"application/json"},
-    body: JSON.stringify({
-      file_id: fileId,
-      file_name: fileName,
-      mappings
-    })
-  });
+  if (!fileId || !fileName) {
+    status.textContent = "❌ חסר File ID או שם קובץ.";
+    return;
+  }
 
-  const data = await r.json();
-  document.getElementById("v7-status").textContent =
-    data.ok
+  status.textContent = "שומר Import Plan...";
+  try {
+    const r = await fetch("/api/import-plan", {
+      method: "POST",
+      headers: {"Content-Type":"application/json"},
+      body: JSON.stringify({
+        file_id: fileId,
+        file_name: fileName,
+        mappings
+      })
+    });
+
+    const data = await r.json();
+    status.textContent = data.ok
       ? "✅ Import Plan נשמר. עדיין לא בוצע Import."
-      : "❌ " + (data.error || "לא נמצא");
+      : "❌ " + (data.error || "שמירת Import Plan נכשלה");
+  } catch (e) {
+    status.textContent = "❌ שגיאה בשמירת Import Plan: " + e.message;
+  }
 }
 </script>
 
