@@ -1,5 +1,6 @@
 
 import os, re, secrets, sqlite3, json, base64, hashlib
+from collections import deque
 from pathlib import Path
 from urllib.parse import urlencode
 
@@ -41,7 +42,17 @@ def db():
     c.row_factory = sqlite3.Row
     c.execute("""CREATE TABLE IF NOT EXISTS drive_sources(
       id INTEGER PRIMARY KEY AUTOINCREMENT,file_id TEXT UNIQUE,name TEXT,mime_type TEXT,
-      size INTEGER,status TEXT,sha256 TEXT,created_at TEXT DEFAULT CURRENT_TIMESTAMP)""")
+      size INTEGER,status TEXT,sha256 TEXT,parent_id TEXT,path TEXT,is_folder INTEGER DEFAULT 0,
+      modified_time TEXT,created_at TEXT DEFAULT CURRENT_TIMESTAMP)""")
+    columns = {row[1] for row in c.execute("PRAGMA table_info(drive_sources)").fetchall()}
+    for name, definition in {
+        "parent_id": "TEXT",
+        "path": "TEXT",
+        "is_folder": "INTEGER DEFAULT 0",
+        "modified_time": "TEXT",
+    }.items():
+        if name not in columns:
+            c.execute(f"ALTER TABLE drive_sources ADD COLUMN {name} {definition}")
     c.commit()
     return c
 
@@ -267,17 +278,15 @@ def drive_files(request: Request):
             "stage": "token_refresh",
             "error_type": type(e).__name__,
             "error": html.escape(str(e)),
-            "message": "Google הצליח לאמת את האפליקציה, אבל לא הצלחנו לרענן את הרשאת Drive. בדוק שה-GOOGLE_REFRESH_TOKEN שייך לאותו OAuth Client."
+            "message": "Google הצליח לאמת את האפליקציה, אבל לא הצלחנו לרענן את הרשאת Drive."
         }, status_code=400)
 
     try:
         service = build("drive", "v3", credentials=creds, cache_discovery=False)
-
-        # First verify that the configured ID is a readable folder. This gives
-        # a much more useful diagnosis than a generic files.list failure.
+        item_fields = "id,name,mimeType,size,modifiedTime,webViewLink,driveId,parents,trashed"
         folder = service.files().get(
             fileId=DRIVE_FOLDER_ID,
-            fields="id,name,mimeType,driveId,trashed,capabilities(canListChildren)",
+            fields=f"{item_fields},capabilities(canListChildren)",
             supportsAllDrives=True,
         ).execute()
 
@@ -290,23 +299,72 @@ def drive_files(request: Request):
                 "item": folder,
             }, status_code=400)
 
-        # Google Drive's list API uses '<folderId>' in parents for children.
-        # Include all drives so the same code also works if the folder is moved
-        # to a Shared Drive.
-        q = f"'{DRIVE_FOLDER_ID}' in parents and trashed = false"
-        result = service.files().list(
-            q=q,
-            spaces="drive",
-            fields="nextPageToken,files(id,name,mimeType,size,modifiedTime,webViewLink,driveId)",
-            pageSize=1000,
-            orderBy="name_natural",
-            includeItemsFromAllDrives=True,
-            supportsAllDrives=True,
-        ).execute()
+        # Discovery is metadata-only: no files().get_media() or file content
+        # is ever requested. The queue keeps only folder IDs and paths, while
+        # each Drive list page is processed immediately instead of loading a
+        # whole dataset into memory.
+        queue = deque([(DRIVE_FOLDER_ID, folder.get("name") or DRIVE_FOLDER_ID)])
+        visited = set()
+        discovered_files = []
+        discovered_folders = []
+        c = db()
+        c.execute("DELETE FROM drive_sources")
+
+        while queue:
+            parent_id, parent_path = queue.popleft()
+            if parent_id in visited:
+                continue
+            visited.add(parent_id)
+            page_token = None
+            while True:
+                result = service.files().list(
+                    q=f"'{parent_id}' in parents and trashed = false",
+                    spaces="drive",
+                    fields=f"nextPageToken,files({item_fields})",
+                    pageSize=1000,
+                    orderBy="name_natural",
+                    pageToken=page_token,
+                    includeItemsFromAllDrives=True,
+                    supportsAllDrives=True,
+                ).execute()
+                for item in result.get("files", []):
+                    item_path = f"{parent_path}/{item.get('name', item.get('id', ''))}"
+                    is_folder = item.get("mimeType") == "application/vnd.google-apps.folder"
+                    size = item.get("size")
+                    size_value = int(size) if size and str(size).isdigit() else None
+                    c.execute(
+                        """INSERT OR REPLACE INTO drive_sources
+                        (file_id,name,mime_type,size,status,sha256,parent_id,path,is_folder,modified_time)
+                        VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                        (item.get("id"), item.get("name"), item.get("mimeType"), size_value,
+                         "discovered", None, parent_id, item_path, 1 if is_folder else 0,
+                         item.get("modifiedTime")),
+                    )
+                    metadata = {
+                        "name": item.get("name"),
+                        "id": item.get("id"),
+                        "mimeType": item.get("mimeType"),
+                        "size": size,
+                        "modifiedTime": item.get("modifiedTime"),
+                        "path": item_path,
+                        "parents": item.get("parents", []),
+                        "webViewLink": item.get("webViewLink"),
+                        "driveId": item.get("driveId"),
+                    }
+                    if is_folder:
+                        discovered_folders.append(metadata)
+                        queue.append((item.get("id"), item_path))
+                    else:
+                        discovered_files.append(metadata)
+                page_token = result.get("nextPageToken")
+                if not page_token:
+                    break
+        c.commit()
+        c.close()
 
         return {
             "ok": True,
-            "stage": "list",
+            "stage": "recursive_discovery",
             "folder": {
                 "id": folder.get("id"),
                 "name": folder.get("name"),
@@ -314,13 +372,15 @@ def drive_files(request: Request):
                 "driveId": folder.get("driveId"),
                 "canListChildren": (folder.get("capabilities") or {}).get("canListChildren"),
             },
-            "count": len(result.get("files", [])),
-            "files": result.get("files", []),
+            "count": len(discovered_files),
+            "folder_count": len(discovered_folders),
+            "files": discovered_files,
+            "folders": discovered_folders,
+            "downloaded": False,
         }
     except Exception as e:
         import html
         text = str(e)
-        # Return only diagnostic API information, never credentials.
         details = text
         try:
             import json as _json
@@ -338,7 +398,7 @@ def drive_files(request: Request):
             "stage": "drive_api",
             "error_type": type(e).__name__,
             "error": html.escape(details),
-            "message": "Google Drive דחה את הבקשה. הפרטים למטה מיועדים לאבחון ואינם כוללים token או secret."
+            "message": "Google Drive דחה את בקשת ה-Discovery. הפרטים למטה אינם כוללים token או secret."
         }, status_code=400)
 
 @app.get("/api/status")
