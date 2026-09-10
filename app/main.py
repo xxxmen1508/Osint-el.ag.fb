@@ -1,5 +1,5 @@
 
-import os, re, secrets, sqlite3, json
+import os, re, secrets, sqlite3, json, base64, hashlib
 from pathlib import Path
 from urllib.parse import urlencode
 
@@ -118,12 +118,18 @@ def google_login(request: Request):
     if not (GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET):
         raise HTTPException(400, "GOOGLE_CLIENT_ID/GOOGLE_CLIENT_SECRET חסרים ב-Render")
     flow = oauth_flow()
+    # Google may require PKCE for this OAuth client. The verifier must survive
+    # the redirect and be supplied again when exchanging the authorization code.
+    code_verifier = secrets.token_urlsafe(64)
+    flow.code_verifier = code_verifier
     authorization_url, state = flow.authorization_url(
         access_type="offline",
         include_granted_scopes="true",
         prompt="consent",
+        code_challenge_method="S256",
     )
     request.session["oauth_state"] = state
+    request.session["oauth_code_verifier"] = code_verifier
     return RedirectResponse(authorization_url)
 
 @app.get("/oauth2callback", response_class=HTMLResponse)
@@ -135,8 +141,14 @@ def oauth2callback(request: Request, code: str = "", state: str = ""):
         return HTMLResponse("<h2>OAuth state mismatch</h2>", status_code=400)
 
     flow = oauth_flow(state=state or None)
+    code_verifier = request.session.get("oauth_code_verifier")
+    if not code_verifier:
+        return HTMLResponse(
+            "<h2>Google OAuth error</h2><p>חסר code_verifier של PKCE. התחל התחברות מחדש.</p>",
+            status_code=400,
+        )
     try:
-        flow.fetch_token(code=code)
+        flow.fetch_token(code=code, code_verifier=code_verifier)
     except Exception as e:
         # Show the OAuth error category/details to the admin, but never expose
         # client secrets or tokens. This makes configuration errors diagnosable.
