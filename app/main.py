@@ -305,6 +305,7 @@ def drive_diagnostics(request: Request):
         "account": None,
         "folder": None,
         "folder_check": None,
+        "folder_name_search": None,
         "parent_query": None,
         "user_corpus_query": None,
         "shared_drive_query": None,
@@ -373,6 +374,21 @@ def drive_diagnostics(request: Request):
         "configured_folder_children",
         q=f"'{DRIVE_FOLDER_ID}' in parents and trashed = false",
     )
+    result["folder_name_search"] = run_list(
+        "folders_named_מאגרים",
+        q="name = 'מאגרים' and mimeType = 'application/vnd.google-apps.folder' and trashed = false",
+        corpora="user",
+    )
+    result["folder_name_search"]["matches"] = [
+        {
+            "id": item.get("id"),
+            "name": item.get("name"),
+            "parents": item.get("parents", []),
+            "driveId": item.get("driveId"),
+            "mimeType": item.get("mimeType"),
+        }
+        for item in result["folder_name_search"].get("items", [])
+    ]
     result["user_corpus_query"] = run_list(
         "user_corpus_without_parent_filter",
         q="trashed = false",
