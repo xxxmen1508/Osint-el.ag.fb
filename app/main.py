@@ -277,7 +277,22 @@ def drive_item_summary(item):
         "parents": item.get("parents", []),
         "driveId": item.get("driveId"),
         "trashed": item.get("trashed"),
+        "shortcutDetails": item.get("shortcutDetails"),
     }
+
+def drive_permissions(service, file_id):
+    try:
+        response = service.permissions().list(
+            fileId=file_id,
+            fields="permissions(id,type,emailAddress,role,displayName,domain,allowFileDiscovery)",
+            supportsAllDrives=True,
+        ).execute()
+        return {
+            "ok": True,
+            "permissions": response.get("permissions", []),
+        }
+    except Exception as e:
+        return {"ok": False, **safe_drive_error(e)}
 
 @app.get("/api/drive/diagnostics")
 def drive_diagnostics(request: Request):
@@ -305,8 +320,11 @@ def drive_diagnostics(request: Request):
         "account": None,
         "folder": None,
         "folder_check": None,
+        "folder_permissions": None,
         "folder_name_search": None,
         "parent_query": None,
+        "parent_shortcuts_query": None,
+        "expected_file_searches": [],
         "user_corpus_query": None,
         "shared_drive_query": None,
         "interpretation": [],
@@ -323,7 +341,7 @@ def drive_diagnostics(request: Request):
     except Exception as e:
         result["account"] = {"ok": False, **safe_drive_error(e)}
 
-    item_fields = "id,name,mimeType,size,modifiedTime,webViewLink,driveId,parents,trashed"
+    item_fields = "id,name,mimeType,size,modifiedTime,webViewLink,driveId,parents,trashed,shortcutDetails(targetId,targetMimeType)"
     try:
         folder = service.files().get(
             fileId=DRIVE_FOLDER_ID,
@@ -342,6 +360,7 @@ def drive_diagnostics(request: Request):
             "canListChildren": (folder.get("capabilities") or {}).get("canListChildren"),
             "driveId": folder_drive_id,
         }
+        result["folder_permissions"] = drive_permissions(service, DRIVE_FOLDER_ID)
     except Exception as e:
         result["folder_check"] = {"ok": False, **safe_drive_error(e)}
         result["ok"] = False
@@ -374,6 +393,10 @@ def drive_diagnostics(request: Request):
         "configured_folder_children",
         q=f"'{DRIVE_FOLDER_ID}' in parents and trashed = false",
     )
+    result["parent_shortcuts_query"] = run_list(
+        "configured_folder_shortcuts",
+        q=f"'{DRIVE_FOLDER_ID}' in parents and mimeType = 'application/vnd.google-apps.shortcut' and trashed = false",
+    )
     result["folder_name_search"] = run_list(
         "folders_named_מאגרים",
         q="name = 'מאגרים' and mimeType = 'application/vnd.google-apps.folder' and trashed = false",
@@ -389,6 +412,20 @@ def drive_diagnostics(request: Request):
         }
         for item in result["folder_name_search"].get("items", [])
     ]
+    expected_terms = ["AGRON2006", "Elector", "Facebook"]
+    for term in expected_terms:
+        search = run_list(
+            f"expected_name_search_{term}",
+            q=f"name contains '{term}' and trashed = false",
+            corpora="user",
+        )
+        candidates = []
+        for item in search.get("items", [])[:20]:
+            candidate = drive_item_summary(item)
+            candidate["permissions"] = drive_permissions(service, item.get("id"))
+            candidates.append(candidate)
+        search["matches"] = candidates
+        result["expected_file_searches"].append(search)
     result["user_corpus_query"] = run_list(
         "user_corpus_without_parent_filter",
         q="trashed = false",
