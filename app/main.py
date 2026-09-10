@@ -254,8 +254,11 @@ def get_analysis(file_id: str, request: Request):
     c = db()
     row = c.execute("SELECT * FROM dataset_analysis WHERE file_id=?", (file_id,)).fetchone()
     c.close()
+    # Render Free has an ephemeral filesystem, so a successful Analyze from a
+    # previous deployment may no longer exist in SQLite. If it is missing,
+    # transparently re-run the lightweight sample-only Analyze from Google Drive.
     if not row:
-        return JSONResponse({"ok": False, "error": "לא נמצאה אנליזת Analyze לקובץ הזה"}, status_code=404)
+        return analyze_drive_file(request=request, file_id=file_id)
     d = dict(row)
     for k in ("columns_json", "type_candidates_json", "quality_json", "sample_json"):
         if d.get(k):
