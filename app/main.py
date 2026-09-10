@@ -29,7 +29,7 @@ REDIRECT_URI = os.getenv(
     "https://osint-el-ag-fb.onrender.com/oauth2callback",
 )
 
-app = FastAPI(title="Unified AI Data Intelligence Lab V3")
+app = FastAPI(title="Unified AI Data Intelligence Lab V4")
 app.add_middleware(SessionMiddleware, secret_key=SESSION_SECRET)
 templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 
@@ -77,7 +77,7 @@ def oauth_flow(state=None):
 def health():
     return {
         "ok": True,
-        "version": "v3",
+        "version": "v4",
         "drive_folder_configured": bool(DRIVE_FOLDER_ID),
         "oauth_client_configured": bool(GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET),
         "refresh_token_configured": bool(GOOGLE_REFRESH_TOKEN),
@@ -188,25 +188,97 @@ def drive_files(request: Request):
     if not is_admin(request):
         raise HTTPException(403)
     if not DRIVE_FOLDER_ID:
-        return JSONResponse({"ok": False, "message": "DRIVE_FOLDER_ID חסר"})
+        return JSONResponse({"ok": False, "message": "DRIVE_FOLDER_ID חסר"}, status_code=400)
     creds = credentials_from_env()
     if not creds:
-        return JSONResponse({"ok": False, "message": "Google OAuth עדיין לא מחובר"})
+        return JSONResponse({"ok": False, "message": "Google OAuth עדיין לא מחובר"}, status_code=400)
+
+    # Do not log or return tokens/secrets. Refresh explicitly so failures are
+    # distinguishable from folder/permission failures.
+    try:
+        from google.auth.transport.requests import Request as GoogleRequest
+        if not creds.valid:
+            creds.refresh(GoogleRequest())
+    except Exception as e:
+        import html
+        return JSONResponse({
+            "ok": False,
+            "stage": "token_refresh",
+            "error_type": type(e).__name__,
+            "error": html.escape(str(e)),
+            "message": "Google הצליח לאמת את האפליקציה, אבל לא הצלחנו לרענן את הרשאת Drive. בדוק שה-GOOGLE_REFRESH_TOKEN שייך לאותו OAuth Client."
+        }, status_code=400)
+
     try:
         service = build("drive", "v3", credentials=creds, cache_discovery=False)
+
+        # First verify that the configured ID is a readable folder. This gives
+        # a much more useful diagnosis than a generic files.list failure.
+        folder = service.files().get(
+            fileId=DRIVE_FOLDER_ID,
+            fields="id,name,mimeType,driveId,trashed,capabilities(canListChildren)",
+            supportsAllDrives=True,
+        ).execute()
+
+        if folder.get("mimeType") != "application/vnd.google-apps.folder":
+            return JSONResponse({
+                "ok": False,
+                "stage": "folder_check",
+                "error": "not_a_folder",
+                "message": "ה-FOLDER ID שהוגדר אינו מצביע על תיקיית Google Drive.",
+                "item": folder,
+            }, status_code=400)
+
+        # Google Drive's list API uses '<folderId>' in parents for children.
+        # Include all drives so the same code also works if the folder is moved
+        # to a Shared Drive.
         q = f"'{DRIVE_FOLDER_ID}' in parents and trashed = false"
         result = service.files().list(
             q=q,
-            fields="files(id,name,mimeType,size,modifiedTime,webViewLink)",
+            spaces="drive",
+            fields="nextPageToken,files(id,name,mimeType,size,modifiedTime,webViewLink,driveId)",
             pageSize=1000,
-            orderBy="name",
+            orderBy="name_natural",
+            includeItemsFromAllDrives=True,
+            supportsAllDrives=True,
         ).execute()
-        return {"ok": True, "files": result.get("files", [])}
-    except Exception:
-        return JSONResponse(
-            {"ok": False, "message": "לא ניתן לקרוא את תיקיית Google Drive. בדוק הרשאה ו-FOLDER ID."},
-            status_code=400,
-        )
+
+        return {
+            "ok": True,
+            "stage": "list",
+            "folder": {
+                "id": folder.get("id"),
+                "name": folder.get("name"),
+                "mimeType": folder.get("mimeType"),
+                "driveId": folder.get("driveId"),
+                "canListChildren": (folder.get("capabilities") or {}).get("canListChildren"),
+            },
+            "count": len(result.get("files", [])),
+            "files": result.get("files", []),
+        }
+    except Exception as e:
+        import html
+        text = str(e)
+        # Return only diagnostic API information, never credentials.
+        details = text
+        try:
+            import json as _json
+            if hasattr(e, "content") and e.content:
+                raw = e.content.decode("utf-8", "replace") if isinstance(e.content, (bytes, bytearray)) else str(e.content)
+                try:
+                    payload = _json.loads(raw)
+                    details = _json.dumps(payload, ensure_ascii=False)
+                except Exception:
+                    details = raw
+        except Exception:
+            pass
+        return JSONResponse({
+            "ok": False,
+            "stage": "drive_api",
+            "error_type": type(e).__name__,
+            "error": html.escape(details),
+            "message": "Google Drive דחה את הבקשה. הפרטים למטה מיועדים לאבחון ואינם כוללים token או secret."
+        }, status_code=400)
 
 @app.get("/api/status")
 def status(request: Request):
