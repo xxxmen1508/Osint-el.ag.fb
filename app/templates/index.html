@@ -924,25 +924,16 @@ async function v7LoadAnalyze() {
 
   status.textContent = "טוען נתוני Analyze...";
 
-  // Existing project endpoint is /api/status; use its returned analysis if available.
   try {
-    const r = await fetch("/api/status");
+    const r = await fetch("/api/analysis/" + encodeURIComponent(id));
     const data = await r.json();
-
-    let analysis = null;
-    if (Array.isArray(data.analyses)) {
-      analysis = data.analyses.find(x => String(x.file_id) === id || String(x.id) === id);
-    }
-    if (!analysis && data.analysis && String(data.analysis.file_id || data.analysis.id) === id) {
-      analysis = data.analysis;
-    }
-
-    if (!analysis) {
-      status.textContent = "לא נמצא — לא נמצאה תוצאת Analyze זמינה דרך /api/status.";
+    if (!r.ok || !data.ok || !data.analysis) {
+      status.textContent = "לא נמצא — לא קיימת תוצאת Analyze שמורה לקובץ הזה.";
       return;
     }
+    const analysis = data.analysis;
+    analysis.columns = analysis.columns || [];
 
-    v7Data = analysis;
     v7RenderAnalysis(analysis);
     save.style.display = "inline-block";
     status.textContent = "תוצאות Analyze נטענו. בדוק ואשר כל עמודה לפני Import.";
