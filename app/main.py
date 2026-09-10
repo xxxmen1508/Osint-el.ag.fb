@@ -230,175 +230,88 @@ def oauth_flow(state=None):
 # ============================================================
 
 
-# V7: persistent Admin Review / Import Plan.
-# This table stores only reviewed metadata; it never replaces raw source records.
-try:
-    conn.execute("""
-    CREATE TABLE IF NOT EXISTS import_plans (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        file_id TEXT NOT NULL,
-        file_name TEXT NOT NULL,
-        status TEXT NOT NULL DEFAULT 'draft',
-        plan_json TEXT NOT NULL,
-        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-        updated_at TEXT DEFAULT CURRENT_TIMESTAMP
-    )
-    """)
-    conn.commit()
-except Exception:
-    pass
+# V7.1: persistent Admin Review / Import Plan.
+# Metadata only; raw source files remain in Google Drive.
 
+def ensure_import_plans_table(c):
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS import_plans (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            file_id TEXT NOT NULL,
+            file_name TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'draft',
+            plan_json TEXT NOT NULL,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    c.commit()
+
+@app.get("/api/analysis/{file_id}")
+def get_analysis(file_id: str, request: Request):
+    if not is_admin(request):
+        raise HTTPException(403)
+    c = db()
+    row = c.execute("SELECT * FROM dataset_analysis WHERE file_id=?", (file_id,)).fetchone()
+    c.close()
+    if not row:
+        return JSONResponse({"ok": False, "error": "לא נמצאה אנליזת Analyze לקובץ הזה"}, status_code=404)
+    d = dict(row)
+    for k in ("columns_json", "type_candidates_json", "quality_json", "sample_json"):
+        if d.get(k):
+            try: d[k[:-5] if k.endswith('_json') else k] = json.loads(d[k])
+            except Exception: pass
+    return {"ok": True, "analysis": d}
 
 @app.get("/api/import-plan/{file_id}")
 def get_import_plan(file_id: str, request: Request):
-    """Return the latest reviewed import plan; never invent source data."""
-    require_admin(request)
-
-    row = conn.execute(
-        """
-        SELECT id, file_id, file_name, status, plan_json,
-               created_at, updated_at
-        FROM import_plans
-        WHERE file_id=?
-        ORDER BY id DESC
-        LIMIT 1
-        """,
-        (file_id,)
-    ).fetchone()
-
+    if not is_admin(request):
+        raise HTTPException(403)
+    c = db(); ensure_import_plans_table(c)
+    row = c.execute("SELECT id,file_id,file_name,status,plan_json,created_at,updated_at FROM import_plans WHERE file_id=? ORDER BY id DESC LIMIT 1", (file_id,)).fetchone()
+    c.close()
     if not row:
-        return {
-            "ok": True,
-            "status": "not_created",
-            "file_id": file_id,
-            "plan": None
-        }
-
-    return {
-        "ok": True,
-        "status": row[3],
-        "plan_id": row[0],
-        "file_id": row[1],
-        "file_name": row[2],
-        "plan": json.loads(row[4]),
-        "created_at": row[5],
-        "updated_at": row[6]
-    }
-
+        return {"ok": True, "status": "not_created", "file_id": file_id, "plan": None}
+    return {"ok": True, "status": row[3], "plan_id": row[0], "file_id": row[1], "file_name": row[2], "plan": json.loads(row[4]), "created_at": row[5], "updated_at": row[6]}
 
 @app.post("/api/import-plan")
 async def save_import_plan(request: Request):
-    """Validate and save an explicit Admin-reviewed mapping. No import starts."""
-    require_admin(request)
-
+    if not is_admin(request):
+        raise HTTPException(403)
     body = await request.json()
     file_id = str(body.get("file_id", "")).strip()
     file_name = str(body.get("file_name", "")).strip()
     mappings = body.get("mappings")
-
     if not file_id or not file_name or not isinstance(mappings, list):
-        return JSONResponse(
-            {"ok": False, "error": "נדרש file_id, file_name ו-mappings"},
-            status_code=400
-        )
-
-    # Locate analysis using the project's existing dataset_analysis schema.
-    analysis = conn.execute(
-        """
-        SELECT file_id, name, status, encoding, delimiter,
-               column_count, header_detected
-        FROM dataset_analysis
-        WHERE file_id=?
-        """,
-        (file_id,)
-    ).fetchone()
-
+        return JSONResponse({"ok": False, "error": "נדרש file_id, file_name ו-mappings"}, status_code=400)
+    c = db(); ensure_import_plans_table(c)
+    analysis = c.execute("SELECT file_id,name,status,encoding,delimiter,column_count,header_detected FROM dataset_analysis WHERE file_id=?", (file_id,)).fetchone()
     if not analysis:
-        return JSONResponse(
-            {"ok": False, "error": "לא נמצאה אנליזה לקובץ. יש לבצע Analyze לפני אישור."},
-            status_code=400
-        )
-
-    normalized = []
-    seen = set()
-
-    allowed = {
-        "ignore", "national_id", "phone", "email", "first_name",
-        "last_name", "name", "address", "city", "location",
-        "location_detail", "birth_date", "birth_year", "gender",
-        "relationship_status", "work", "facebook_id",
-        "external_numeric_id", "identifier", "text"
-    }
-
+        c.close(); return JSONResponse({"ok": False, "error": "לא נמצאה אנליזת Analyze לקובץ. יש לבצע Analyze לפני אישור."}, status_code=400)
+    allowed = {"ignore","national_id","phone","email","first_name","last_name","name","address","city","location","location_detail","birth_date","birth_year","gender","relationship_status","work","facebook_id","external_numeric_id","identifier","text"}
+    normalized=[]; seen=set()
     for item in mappings:
-        if not isinstance(item, dict):
-            return JSONResponse({"ok": False, "error": "Mapping לא תקין"}, status_code=400)
-
-        try:
-            idx = int(item.get("column_index"))
-        except Exception:
-            return JSONResponse({"ok": False, "error": "column_index חייב להיות מספר"}, status_code=400)
-
-        meaning = str(item.get("meaning", "")).strip()
-        if idx < 1 or idx > int(analysis[5]):
-            return JSONResponse({"ok": False, "error": f"עמודה מחוץ לטווח: {idx}"}, status_code=400)
-        if idx in seen:
-            return JSONResponse({"ok": False, "error": f"עמודה {idx} מופיעה יותר מפעם אחת"}, status_code=400)
-        if meaning not in allowed:
-            return JSONResponse({"ok": False, "error": f"meaning לא מוכר: {meaning}"}, status_code=400)
-
-        seen.add(idx)
-        normalized.append({
-            "column_index": idx,
-            "meaning": meaning,
-            "approved": bool(item.get("approved", True)),
-            "notes": str(item.get("notes", "")).strip()
-        })
-
-    plan = {
-        "version": 1,
-        "file": {
-            "id": file_id,
-            "name": file_name,
-            "encoding": analysis[3],
-            "delimiter": analysis[4],
-            "column_count": int(analysis[5]),
-            "header_detected": bool(analysis[6])
-        },
-        "mappings": normalized,
-        "import_allowed": True,
-        "created_by": "admin_review"
-    }
-
-    conn.execute(
-        """
-        INSERT INTO import_plans
-            (file_id, file_name, status, plan_json, updated_at)
-        VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
-        """,
-        (
-            file_id,
-            file_name,
-            "approved_for_import",
-            json.dumps(plan, ensure_ascii=False)
-        )
-    )
-    conn.commit()
-
-    return {
-        "ok": True,
-        "status": "approved_for_import",
-        "message": "Import Plan נשמר. עדיין לא בוצע Import.",
-        "plan": plan
-    }
-
+        if not isinstance(item, dict): c.close(); return JSONResponse({"ok":False,"error":"Mapping לא תקין"},status_code=400)
+        try: idx=int(item.get("column_index"))
+        except Exception: c.close(); return JSONResponse({"ok":False,"error":"column_index חייב להיות מספר"},status_code=400)
+        meaning=str(item.get("meaning","ignore")).strip()
+        if idx<1 or idx>int(analysis[5]): c.close(); return JSONResponse({"ok":False,"error":f"עמודה מחוץ לטווח: {idx}"},status_code=400)
+        if idx in seen: c.close(); return JSONResponse({"ok":False,"error":f"עמודה {idx} מופיעה יותר מפעם אחת"},status_code=400)
+        if meaning not in allowed: c.close(); return JSONResponse({"ok":False,"error":f"meaning לא מוכר: {meaning}"},status_code=400)
+        seen.add(idx); normalized.append({"column_index":idx,"meaning":meaning,"approved":bool(item.get("approved",True)),"notes":str(item.get("notes","")).strip()})
+    if len(seen) != int(analysis[5]):
+        c.close(); return JSONResponse({"ok":False,"error":f"יש לאשר מיפוי לכל {int(analysis[5])} העמודות. התקבלו {len(seen)} בלבד."},status_code=400)
+    plan={"version":1,"file":{"id":file_id,"name":file_name,"encoding":analysis[3],"delimiter":analysis[4],"column_count":int(analysis[5]),"header_detected":bool(analysis[6])},"mappings":normalized,"import_allowed":True,"created_by":"admin_review"}
+    c.execute("INSERT INTO import_plans(file_id,file_name,status,plan_json,updated_at) VALUES(?,?,?,?,CURRENT_TIMESTAMP)",(file_id,file_name,"approved_for_import",json.dumps(plan,ensure_ascii=False)))
+    c.commit(); c.close()
+    return {"ok":True,"status":"approved_for_import","message":"Import Plan נשמר. עדיין לא בוצע Import.","plan":plan}
 
 @app.get("/health")
 def health():
 
     return {
         "ok": True,
-        "version": "v6-analyze",
+        "version": "v7.1-review",
 
         "drive_folder_configured":
             bool(DRIVE_FOLDER_ID),
@@ -3259,7 +3172,18 @@ def status(request: Request):
         """
     ).fetchall()
 
+    analyses = c.execute("SELECT file_id,name,status,analyzed_at,encoding,delimiter,column_count,header_detected,quality_json FROM dataset_analysis ORDER BY analyzed_at DESC").fetchall()
+    analysis_list=[]
+    for a in analyses:
+        x=dict(a)
+        if x.get("quality_json"):
+            try: x["quality"]=json.loads(x["quality_json"])
+            except Exception: pass
+        analysis_list.append(x)
+
     return {
+
+        "analyses": analysis_list,
 
         "drive_folder_id":
             DRIVE_FOLDER_ID or None,
