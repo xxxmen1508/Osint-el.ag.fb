@@ -1210,6 +1210,7 @@ def drive_files(request: Request):
         )
 
         if not creds.valid:
+
             creds.refresh(
                 GoogleRequest()
             )
@@ -1595,6 +1596,15 @@ def drive_files(request: Request):
 # ============================================================
 
 def guess_encoding(raw):
+    """
+    זיהוי שמרני של encoding.
+
+    חשוב:
+    - UTF-8 מקבל עדיפות כאשר הוא באמת מתאים לנתונים.
+    - נבדקים סימנים של mojibake.
+    - לא מתבצע שינוי של הנתונים המקוריים.
+    - ה-encoding הוא תוצאת ניתוח בלבד.
+    """
 
     candidates = [
         ("utf-8-sig", "strong"),
@@ -1605,6 +1615,74 @@ def guess_encoding(raw):
         ("cp1252", "low"),
         ("latin-1", "low"),
     ]
+
+    mojibake_markers = [
+        "Ã",
+        "Â",
+        "â€",
+        "â€™",
+        "â€œ",
+        "â€",
+        "×",
+        "Ø",
+        "Ù",
+        "Ð",
+        "Ñ",
+        "�",
+    ]
+
+    def score_text(text):
+
+        if not text:
+            return -999999
+
+        score = 0
+
+        replacement_count = text.count(
+            "\ufffd"
+        )
+
+        score -= replacement_count * 100
+
+        for marker in mojibake_markers:
+            score -= text.count(marker) * 3
+
+        hebrew_count = len(
+            re.findall(
+                r"[\u0590-\u05FF]",
+                text
+            )
+        )
+
+        score += min(
+            hebrew_count,
+            500
+        ) * 2
+
+        alnum_count = len(
+            re.findall(
+                r"[A-Za-z0-9]",
+                text
+            )
+        )
+
+        score += min(
+            alnum_count,
+            500
+        )
+
+        control_count = len(
+            re.findall(
+                r"[\x00-\x08\x0B\x0C\x0E-\x1F]",
+                text
+            )
+        )
+
+        score -= control_count * 5
+
+        return score
+
+    successful = []
 
     for encoding, confidence in candidates:
 
@@ -1619,19 +1697,77 @@ def guess_encoding(raw):
                 "\ufffd"
             )
 
-            if replacement_count == 0:
+            if replacement_count > 0:
+                continue
 
-                return (
+            score = score_text(
+                text
+            )
+
+            successful.append({
+                "encoding":
                     encoding,
-                    confidence
-                )
+
+                "confidence":
+                    confidence,
+
+                "score":
+                    score,
+
+                "text":
+                    text,
+            })
 
         except UnicodeDecodeError:
             continue
 
+    if not successful:
+
+        return (
+            "utf-8",
+            "low"
+        )
+
+    successful.sort(
+        key=lambda item:
+            item["score"],
+        reverse=True
+    )
+
+    best = successful[0]
+
+    utf8_candidates = [
+        item
+        for item in successful
+        if item["encoding"]
+        in (
+            "utf-8",
+            "utf-8-sig"
+        )
+    ]
+
+    if utf8_candidates:
+
+        utf8_best = max(
+            utf8_candidates,
+            key=lambda item:
+                item["score"]
+        )
+
+        if (
+            utf8_best["score"]
+            >=
+            best["score"] - 50
+        ):
+
+            return (
+                utf8_best["encoding"],
+                "strong"
+            )
+
     return (
-        "utf-8",
-        "low"
+        best["encoding"],
+        best["confidence"]
     )
 
 
@@ -2038,6 +2174,409 @@ def semantic_candidates(
     return candidates
 
 
+def positional_semantic_candidates(
+    position,
+    vals
+):
+    """
+    הצעת מיפוי סמנטי עבור Dataset ללא Header.
+
+    חשוב מאוד:
+    אלה הצעות בלבד.
+    הן אינן הופכות את הנתון לעובדה מאומתת,
+    ואסור לבצע לפיהן Merge אוטומטי ללא אישור Admin.
+    """
+
+    values = [
+        str(v).strip()
+        for v in (vals or [])
+        if v is not None
+        and str(v).strip()
+    ]
+
+    if not values:
+        return []
+
+    sample = values[:200]
+
+    def looks_like_phone_or_numeric_id(v):
+
+        digits = re.sub(
+            r"\D",
+            "",
+            v
+        )
+
+        if not digits:
+            return False
+
+        return len(digits) in (
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15
+        )
+
+    def looks_like_email(v):
+
+        return bool(
+            re.match(
+                r"^[^@\s]+@[^@\s]+\.[^@\s]+$",
+                v
+            )
+        )
+
+    def looks_like_year(v):
+
+        return bool(
+            re.match(
+                r"^(19|20)\d{2}$",
+                v
+            )
+        )
+
+    def looks_like_date(v):
+
+        return bool(
+            re.match(
+                r"^\d{1,2}[/-]\d{1,2}([/-]\d{2,4})?$",
+                v
+            )
+        )
+
+    def looks_like_gender(v):
+
+        normalized = v.lower().strip()
+
+        return normalized in {
+            "male",
+            "female",
+            "m",
+            "f",
+            "man",
+            "woman",
+            "זכר",
+            "נקבה",
+            "גבר",
+            "אישה",
+        }
+
+    def looks_like_location(v):
+
+        if "," in v:
+            return True
+
+        location_words = [
+            "israel",
+            "russia",
+            "usa",
+            "united states",
+            "uk",
+            "canada",
+            "ישראל",
+            "רוסיה",
+            "ארה״ב",
+            "ארהב",
+        ]
+
+        normalized = v.lower()
+
+        return any(
+            word in normalized
+            for word in location_words
+        )
+
+    email_ratio = sum(
+        looks_like_email(v)
+        for v in sample
+    ) / max(
+        len(sample),
+        1
+    )
+
+    phone_ratio = sum(
+        looks_like_phone_or_numeric_id(v)
+        for v in sample
+    ) / max(
+        len(sample),
+        1
+    )
+
+    year_ratio = sum(
+        looks_like_year(v)
+        for v in sample
+    ) / max(
+        len(sample),
+        1
+    )
+
+    date_ratio = sum(
+        looks_like_date(v)
+        for v in sample
+    ) / max(
+        len(sample),
+        1
+    )
+
+    gender_ratio = sum(
+        looks_like_gender(v)
+        for v in sample
+    ) / max(
+        len(sample),
+        1
+    )
+
+    location_ratio = sum(
+        looks_like_location(v)
+        for v in sample
+    ) / max(
+        len(sample),
+        1
+    )
+
+    positional_map = {
+
+        1: [
+            {
+                "meaning":
+                    "phone",
+
+                "confidence":
+                    "medium",
+
+                "reason":
+                    "Column contains phone-like numeric values",
+            },
+
+            {
+                "meaning":
+                    "facebook_phone",
+
+                "confidence":
+                    "low",
+
+                "reason":
+                    "Could represent a Facebook-associated phone value",
+            },
+        ],
+
+        2: [
+            {
+                "meaning":
+                    "facebook_id",
+
+                "confidence":
+                    "medium",
+
+                "reason":
+                    "Column contains numeric identifier-like values",
+            },
+        ],
+
+        3: [
+            {
+                "meaning":
+                    "first_name",
+
+                "confidence":
+                    "medium",
+
+                "reason":
+                    "Column contains short person-name-like text",
+            },
+        ],
+
+        4: [
+            {
+                "meaning":
+                    "last_name",
+
+                "confidence":
+                    "medium",
+
+                "reason":
+                    "Column contains short person-name-like text",
+            },
+        ],
+
+        5: [
+            {
+                "meaning":
+                    "gender",
+
+                "confidence":
+                    (
+                        "high"
+                        if gender_ratio >= 0.80
+                        else "medium"
+                    ),
+
+                "reason":
+                    "Values match common gender labels",
+            },
+        ],
+
+        6: [
+            {
+                "meaning":
+                    "location",
+
+                "confidence":
+                    "medium",
+
+                "reason":
+                    "Values look like geographic locations",
+            },
+        ],
+
+        7: [
+            {
+                "meaning":
+                    "location_detail",
+
+                "confidence":
+                    "low",
+
+                "reason":
+                    "Values look like secondary geographic information",
+            },
+        ],
+
+        8: [
+            {
+                "meaning":
+                    "relationship_status",
+
+                "confidence":
+                    "medium",
+
+                "reason":
+                    "Values look like relationship-status text",
+            },
+        ],
+
+        9: [
+            {
+                "meaning":
+                    "work",
+
+                "confidence":
+                    "medium",
+
+                "reason":
+                    "Values contain free-form occupation/work descriptions",
+            },
+        ],
+
+        10: [
+            {
+                "meaning":
+                    "birth_year",
+
+                "confidence":
+                    (
+                        "high"
+                        if year_ratio >= 0.80
+                        else "medium"
+                    ),
+
+                "reason":
+                    "Values predominantly look like four-digit years",
+            },
+        ],
+
+        11: [
+            {
+                "meaning":
+                    "email",
+
+                "confidence":
+                    (
+                        "high"
+                        if email_ratio >= 0.80
+                        else "medium"
+                    ),
+
+                "reason":
+                    "Values predominantly match email syntax",
+            },
+        ],
+
+        12: [
+            {
+                "meaning":
+                    "birth_date",
+
+                "confidence":
+                    (
+                        "high"
+                        if date_ratio >= 0.80
+                        else "medium"
+                    ),
+
+                "reason":
+                    "Values predominantly match date syntax",
+            },
+        ],
+    }
+
+    candidates = positional_map.get(
+        position,
+        []
+    )
+
+    filtered = []
+
+    for candidate in candidates:
+
+        field = candidate["meaning"]
+
+        if field == "email":
+
+            if email_ratio >= 0.50:
+                filtered.append(candidate)
+
+        elif field == "birth_year":
+
+            if year_ratio >= 0.50:
+                filtered.append(candidate)
+
+        elif field == "birth_date":
+
+            if date_ratio >= 0.30:
+                filtered.append(candidate)
+
+        elif field == "gender":
+
+            if gender_ratio >= 0.30:
+                filtered.append(candidate)
+
+        elif field in (
+            "location",
+            "location_detail"
+        ):
+
+            if location_ratio >= 0.20:
+                filtered.append(candidate)
+
+        elif field in (
+            "phone",
+            "facebook_phone"
+        ):
+
+            if phone_ratio >= 0.50:
+                filtered.append(candidate)
+
+        else:
+
+            filtered.append(candidate)
+
+    return filtered
+
+
 def analyze_sample_bytes(
     raw,
     total_size
@@ -2138,9 +2677,16 @@ def analyze_sample_bytes(
                 infer_field_type(vals),
 
             "semantic_candidates":
-                semantic_candidates(
-                    name,
-                    vals
+                (
+                    semantic_candidates(
+                        name,
+                        vals
+                    )
+                    or
+                    positional_semantic_candidates(
+                        i + 1,
+                        vals
+                    )
                 ),
 
             "non_empty_sample_count":
