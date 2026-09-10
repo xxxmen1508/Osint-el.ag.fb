@@ -138,8 +138,21 @@ def oauth2callback(request: Request, code: str = "", state: str = ""):
     try:
         flow.fetch_token(code=code)
     except Exception as e:
+        # Show the OAuth error category/details to the admin, but never expose
+        # client secrets or tokens. This makes configuration errors diagnosable.
+        import html
+        err_type = html.escape(type(e).__name__)
+        err_text = html.escape(str(e))
         return HTMLResponse(
-            "<h2>Google OAuth error</h2><p>ההרשאה נכשלה. חזור לאתר ונסה שוב.</p>",
+            f"""<!doctype html><html lang=\"he\" dir=\"rtl\"><meta charset=\"utf-8\">
+            <body style=\"font-family:Arial;max-width:800px;margin:40px auto;padding:20px\">
+            <h2>Google OAuth error</h2>
+            <p>Google דחה את החלפת קוד ההרשאה ב-token.</p>
+            <p><b>סוג שגיאה:</b> <code>{err_type}</code></p>
+            <p><b>פרטי השגיאה:</b></p>
+            <pre style=\"white-space:pre-wrap;background:#eee;padding:14px;direction:ltr;text-align:left\">{err_text}</pre>
+            <p>אל תשלח סודות או tokens. את הטקסט הזה אפשר לשלוח לבדיקה.</p>
+            </body></html>""",
             status_code=400,
         )
 
