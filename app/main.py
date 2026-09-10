@@ -1,4 +1,4 @@
-import os, re, secrets, sqlite3, json, base64, hashlib, csv, io
+import os, re, secrets, sqlite3, json, base64, hashlib, io
 from collections import deque
 from pathlib import Path
 
