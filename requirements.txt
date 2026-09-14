@@ -9,3 +9,4 @@ google-auth-oauthlib
 google-auth-httplib2
 
 cryptography>=42.0.0
+psycopg[binary]>=3.2,<4

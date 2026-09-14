@@ -1,4 +1,4 @@
-import os, re, secrets, sqlite3, json, base64, hashlib, csv, io
+import os, re, secrets, json, base64, hashlib, csv, io
 from collections import deque
 from pathlib import Path
 
@@ -12,12 +12,8 @@ from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 from cryptography.fernet import Fernet, InvalidToken
+from app.db import get_db, metadata_status
 
-
-DATA_DIR = Path(os.getenv("DATA_DIR", "/tmp/unified_ai_lab"))
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-
-DB = DATA_DIR / "lab.db"
 
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "change-me")
 SESSION_SECRET = os.getenv("SESSION_SECRET", secrets.token_hex(32))
@@ -56,67 +52,7 @@ templates = Jinja2Templates(
 # ============================================================
 
 def db():
-    c = sqlite3.connect(DB)
-    c.row_factory = sqlite3.Row
-
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS drive_sources(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            file_id TEXT UNIQUE,
-            name TEXT,
-            mime_type TEXT,
-            size INTEGER,
-            status TEXT,
-            sha256 TEXT,
-            parent_id TEXT,
-            path TEXT,
-            is_folder INTEGER DEFAULT 0,
-            modified_time TEXT,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS dataset_analysis(
-            file_id TEXT PRIMARY KEY,
-            name TEXT,
-            analyzed_at TEXT DEFAULT CURRENT_TIMESTAMP,
-            status TEXT,
-            encoding TEXT,
-            encoding_confidence TEXT,
-            delimiter TEXT,
-            delimiter_confidence TEXT,
-            column_count INTEGER,
-            header_detected INTEGER,
-            columns_json TEXT,
-            type_candidates_json TEXT,
-            quality_json TEXT,
-            sample_json TEXT,
-            error TEXT
-        )
-    """)
-
-    columns = {
-        row[1]
-        for row in c.execute(
-            "PRAGMA table_info(drive_sources)"
-        ).fetchall()
-    }
-
-    for name, definition in {
-        "parent_id": "TEXT",
-        "path": "TEXT",
-        "is_folder": "INTEGER DEFAULT 0",
-        "modified_time": "TEXT",
-    }.items():
-        if name not in columns:
-            c.execute(
-                f"ALTER TABLE drive_sources ADD COLUMN {name} {definition}"
-            )
-
-    c.commit()
-
-    return c
+    return get_db()
 
 
 # ============================================================
@@ -234,25 +170,20 @@ def oauth_flow(state=None):
 # Metadata only; raw source files remain in Google Drive.
 
 def ensure_import_plans_table(c):
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS import_plans (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            file_id TEXT NOT NULL,
-            file_name TEXT NOT NULL,
-            status TEXT NOT NULL DEFAULT 'draft',
-            plan_json TEXT NOT NULL,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    c.commit()
+    # The adapter runs the complete versioned schema migration at connection time.
+    return None
+
+def json_value(value):
+    if isinstance(value, (dict, list)):
+        return value
+    return json.loads(value) if value else None
 
 @app.get("/api/analysis/{file_id}")
 def get_analysis(file_id: str, request: Request):
     if not is_admin(request):
         raise HTTPException(403)
     c = db()
-    row = c.execute("SELECT * FROM dataset_analysis WHERE file_id=?", (file_id,)).fetchone()
+    row = c.execute("SELECT * FROM dataset_analysis WHERE file_id=? ORDER BY analysis_version DESC, id DESC LIMIT 1", (file_id,)).fetchone()
     c.close()
     # Render Free has an ephemeral filesystem, so a successful Analyze from a
     # previous deployment may no longer exist in SQLite. If it is missing,
@@ -272,10 +203,16 @@ def get_import_plan(file_id: str, request: Request):
         raise HTTPException(403)
     c = db(); ensure_import_plans_table(c)
     row = c.execute("SELECT id,file_id,file_name,status,plan_json,created_at,updated_at FROM import_plans WHERE file_id=? ORDER BY id DESC LIMIT 1", (file_id,)).fetchone()
+    source = c.execute("SELECT modified_time,size FROM drive_sources WHERE file_id=? ORDER BY id DESC LIMIT 1", (file_id,)).fetchone()
     c.close()
     if not row:
         return {"ok": True, "status": "not_created", "file_id": file_id, "plan": None}
-    return {"ok": True, "status": row[3], "plan_id": row[0], "file_id": row[1], "file_name": row[2], "plan": json.loads(row[4]), "created_at": row[5], "updated_at": row[6]}
+    plan = json_value(row[4])
+    source_matches = True
+    if source and plan and plan.get("file"):
+        source_matches = (source[0] == plan["file"].get("modifiedTime") and str(source[1] or "") == str(plan["file"].get("size") or ""))
+    status = "stale_source" if not source_matches else row[3]
+    return {"ok": True, "status": status, "source_matches": source_matches, "plan_id": row[0], "file_id": row[1], "file_name": row[2], "plan": plan, "created_at": row[5], "updated_at": row[6]}
 
 @app.post("/api/import-plan")
 async def save_import_plan(request: Request):
@@ -288,7 +225,7 @@ async def save_import_plan(request: Request):
     if not file_id or not file_name or not isinstance(mappings, list):
         return JSONResponse({"ok": False, "error": "נדרש file_id, file_name ו-mappings"}, status_code=400)
     c = db(); ensure_import_plans_table(c)
-    analysis = c.execute("SELECT file_id,name,status,encoding,delimiter,column_count,header_detected FROM dataset_analysis WHERE file_id=?", (file_id,)).fetchone()
+    analysis = c.execute("SELECT id,file_id,name,status,encoding,delimiter,column_count,header_detected,source_modified_time,source_size_bytes,analysis_version FROM dataset_analysis WHERE file_id=? ORDER BY analysis_version DESC, id DESC LIMIT 1", (file_id,)).fetchone()
     if not analysis:
         c.close(); return JSONResponse({"ok": False, "error": "לא נמצאה אנליזת Analyze לקובץ. יש לבצע Analyze לפני אישור."}, status_code=400)
     allowed = {"ignore","national_id","phone","email","first_name","last_name","name","address","city","location","location_detail","birth_date","birth_year","gender","relationship_status","work","facebook_id","external_numeric_id","identifier","text"}
@@ -298,23 +235,26 @@ async def save_import_plan(request: Request):
         try: idx=int(item.get("column_index"))
         except Exception: c.close(); return JSONResponse({"ok":False,"error":"column_index חייב להיות מספר"},status_code=400)
         meaning=str(item.get("meaning","ignore")).strip()
-        if idx<1 or idx>int(analysis[5]): c.close(); return JSONResponse({"ok":False,"error":f"עמודה מחוץ לטווח: {idx}"},status_code=400)
+        if idx<1 or idx>int(analysis[6]): c.close(); return JSONResponse({"ok":False,"error":f"עמודה מחוץ לטווח: {idx}"},status_code=400)
         if idx in seen: c.close(); return JSONResponse({"ok":False,"error":f"עמודה {idx} מופיעה יותר מפעם אחת"},status_code=400)
         if meaning not in allowed: c.close(); return JSONResponse({"ok":False,"error":f"meaning לא מוכר: {meaning}"},status_code=400)
         seen.add(idx); normalized.append({"column_index":idx,"meaning":meaning,"approved":bool(item.get("approved",True)),"notes":str(item.get("notes","")).strip()})
-    if len(seen) != int(analysis[5]):
-        c.close(); return JSONResponse({"ok":False,"error":f"יש לאשר מיפוי לכל {int(analysis[5])} העמודות. התקבלו {len(seen)} בלבד."},status_code=400)
-    plan={"version":1,"file":{"id":file_id,"name":file_name,"encoding":analysis[3],"delimiter":analysis[4],"column_count":int(analysis[5]),"header_detected":bool(analysis[6])},"mappings":normalized,"import_allowed":True,"created_by":"admin_review"}
-    c.execute("INSERT INTO import_plans(file_id,file_name,status,plan_json,updated_at) VALUES(?,?,?,?,CURRENT_TIMESTAMP)",(file_id,file_name,"approved_for_import",json.dumps(plan,ensure_ascii=False)))
+    if len(seen) != int(analysis[6]):
+        c.close(); return JSONResponse({"ok":False,"error":f"יש לאשר מיפוי לכל {int(analysis[6])} העמודות. התקבלו {len(seen)} בלבד."},status_code=400)
+    plan_version = int(c.execute("SELECT COALESCE(MAX(plan_version),0)+1 FROM import_plans WHERE file_id=?", (file_id,)).fetchone()[0])
+    plan={"version":plan_version,"analysis_version":int(analysis[10]),"file":{"id":file_id,"name":file_name,"encoding":analysis[4],"delimiter":analysis[5],"column_count":int(analysis[6]),"header_detected":bool(analysis[7]),"modifiedTime":analysis[8],"size":analysis[9]},"mappings":normalized,"import_allowed":True,"created_by":"admin_review"}
+    c.execute("INSERT INTO import_plans(file_id,file_name,status,plan_json,plan_version,analysis_id,source_modified_time,source_size_bytes,approved_by,approved_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",(file_id,file_name,"approved_for_import",json.dumps(plan,ensure_ascii=False),plan_version,analysis[0],analysis[8],analysis[9],"admin"))
     c.commit(); c.close()
     return {"ok":True,"status":"approved_for_import","message":"Import Plan נשמר. עדיין לא בוצע Import.","plan":plan}
 
 @app.get("/health")
 def health():
 
+    status = metadata_status()
     return {
-        "ok": True,
-        "version": "v7.3-save-fix",
+        "ok": status["metadata_store"] == "connected" or status.get("backend") == "sqlite_development_fallback",
+        "version": "v8-persistence",
+        **status,
 
         "drive_folder_configured":
             bool(DRIVE_FOLDER_ID),
@@ -328,6 +268,13 @@ def health():
         "refresh_token_configured":
             bool(GOOGLE_REFRESH_TOKEN),
     }
+
+@app.get("/ready")
+def readiness():
+    status = metadata_status()
+    if status["metadata_store"] != "connected":
+        return JSONResponse({"ok": False, **status}, status_code=503)
+    return {"ok": True, **status}
 
 
 # ============================================================
@@ -1389,10 +1336,6 @@ def drive_files(request: Request):
 
         c = db()
 
-        c.execute(
-            "DELETE FROM drive_sources"
-        )
-
         while queue:
 
             parent_id, parent_path = (
@@ -1463,7 +1406,7 @@ def drive_files(request: Request):
 
                     c.execute(
                         """
-                        INSERT OR REPLACE INTO drive_sources
+                        INSERT INTO drive_sources
                         (
                             file_id,
                             name,
@@ -1477,6 +1420,14 @@ def drive_files(request: Request):
                             modified_time
                         )
                         VALUES (?,?,?,?,?,?,?,?,?,?)
+                        ON CONFLICT (file_id, modified_time) DO UPDATE SET
+                            name=EXCLUDED.name,
+                            mime_type=EXCLUDED.mime_type,
+                            size=EXCLUDED.size,
+                            status=EXCLUDED.status,
+                            parent_id=EXCLUDED.parent_id,
+                            path=EXCLUDED.path,
+                            is_folder=EXCLUDED.is_folder
                         """,
 
                         (
@@ -3002,12 +2953,17 @@ def analyze_drive_file(
         })
 
         c = db()
+        analysis_version = int(c.execute(
+            "SELECT COALESCE(MAX(analysis_version),0)+1 FROM dataset_analysis WHERE file_id=?",
+            (file_id,)
+        ).fetchone()[0])
 
         c.execute(
             """
-            INSERT OR REPLACE INTO dataset_analysis
+            INSERT INTO dataset_analysis
             (
                 file_id,
+                analysis_version,
                 name,
                 status,
                 encoding,
@@ -3020,13 +2976,17 @@ def analyze_drive_file(
                 type_candidates_json,
                 quality_json,
                 sample_json,
+                source_modified_time,
+                source_size_bytes,
+                analyzer_version,
                 error
             )
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
 
             (
                 file_id,
+                analysis_version,
 
                 meta.get("name"),
 
@@ -3077,6 +3037,9 @@ def analyze_drive_file(
                     ensure_ascii=False
                 ),
 
+                meta.get("modifiedTime"),
+                int(meta.get("size")) if meta.get("size") else None,
+                "v8-persistence-analyzer",
                 None
             )
         )
@@ -3108,23 +3071,13 @@ def analyze_drive_file(
 
         c = db()
 
+        error_version = int(c.execute(
+            "SELECT COALESCE(MAX(analysis_version),0)+1 FROM dataset_analysis WHERE file_id=?",
+            (file_id,)
+        ).fetchone()[0])
         c.execute(
-            """
-            INSERT OR REPLACE INTO dataset_analysis
-            (
-                file_id,
-                name,
-                status,
-                error
-            )
-            VALUES (?,?,?,?)
-            """,
-            (
-                file_id,
-                "",
-                "error",
-                text
-            )
+            "INSERT INTO dataset_analysis(file_id,analysis_version,name,status,error) VALUES(?,?,?,?,?)",
+            (file_id, error_version, "", "error", text)
         )
 
         c.commit()
