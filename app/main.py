@@ -3008,11 +3008,7 @@ def analyze_drive_file(
                     "column_count"
                 ],
 
-                1
-                if result[
-                    "header_detected"
-                ]
-                else 0,
+                bool(result["header_detected"]),
 
                 json.dumps(
                     result["columns"],
