@@ -1439,7 +1439,7 @@ def drive_files(request: Request):
                             None,
                             parent_id,
                             item_path,
-                            1 if is_folder else 0,
+                            is_folder,
                             item.get("modifiedTime"),
                         )
                     )
