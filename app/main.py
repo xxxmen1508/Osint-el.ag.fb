@@ -2,7 +2,7 @@ import os, re, secrets, json, base64, hashlib, csv, io
 from collections import deque
 from pathlib import Path
 
-from fastapi import FastAPI, Request, Form, HTTPException
+from fastapi import FastAPI, Request, Form, HTTPException, BackgroundTasks
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 from starlette.middleware.sessions import SessionMiddleware
@@ -41,6 +41,22 @@ app.add_middleware(
     SessionMiddleware,
     secret_key=SESSION_SECRET
 )
+
+
+@app.on_event("startup")
+def recover_orphaned_sample_jobs_on_startup():
+    """A restart cannot resume in-memory work; preserve records and mark the job recoverable."""
+    try:
+        c = db()
+        c.execute(
+            "UPDATE import_jobs SET status=?,finished_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP,last_error=? WHERE job_type=? AND status=?",
+            ("failed", "orphaned_background_worker_recoverable", "SAMPLE", "running"),
+        )
+        c.commit()
+        c.close()
+    except Exception:
+        # Do not prevent the web app from starting if the metadata store is temporarily unavailable.
+        pass
 
 templates = Jinja2Templates(
     directory=str(Path(__file__).parent / "templates")
@@ -3101,13 +3117,13 @@ def analyze_drive_file(
 
 
 # ============================================================
-# SAMPLE IMPORT (streaming, metadata/raw-values only)
+# SAMPLE IMPORT (non-blocking HTTP trigger + durable background worker)
 # ============================================================
 
 SAMPLE_MAX_ROWS = 10_000
 SAMPLE_MAX_BYTES = 4 * 1024 * 1024
 SAMPLE_MAX_BYTES_CEILING = 50 * 1024 * 1024
-SAMPLE_PARSER_VERSION = "sample-stream-v1"
+SAMPLE_PARSER_VERSION = "sample-stream-v2"
 
 
 def _sample_normalized(values, mappings):
@@ -3130,102 +3146,54 @@ def _sample_normalized(values, mappings):
     return normalized, transformations
 
 
-def _sample_service(request):
-    creds = credentials_from_request(request)
+def _credentials_from_refresh(refresh):
+    if not (GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET and refresh):
+        return None
+    return Credentials(token=None, refresh_token=refresh, token_uri="https://oauth2.googleapis.com/token", client_id=GOOGLE_CLIENT_ID, client_secret=GOOGLE_CLIENT_SECRET, scopes=SCOPES)
+
+
+def _sample_service_from_refresh(refresh):
+    creds = _credentials_from_refresh(refresh)
     if not creds:
-        return None, JSONResponse({"ok": False, "message": "Google OAuth עדיין לא מחובר"}, status_code=400)
+        raise RuntimeError("Google OAuth עדיין לא מחובר")
     from google.auth.transport.requests import Request as GoogleRequest
     if not creds.valid:
         creds.refresh(GoogleRequest())
-    return build("drive", "v3", credentials=creds, cache_discovery=False), None
+    return build("drive", "v3", credentials=creds, cache_discovery=False)
 
 
-def _sample_plan(c, file_id):
-    row = c.execute("SELECT id,file_name,status,plan_json,source_modified_time,source_size_bytes FROM import_plans WHERE file_id=? ORDER BY plan_version DESC,id DESC LIMIT 1", (file_id,)).fetchone()
-    if not row:
-        return None
-    plan = json_value(row[3]) or {}
-    return {"id": row[0], "file_name": row[1], "status": row[2], "plan": plan, "modified_time": row[4], "size": row[5]}
-
-
-def _sample_existing(c, file_id, plan_id, modified_time, size):
-    return c.execute(
-        """SELECT id,status,rows_read,rows_written,rows_failed,bytes_read,last_error,full_file_downloaded
-           FROM import_jobs
-           WHERE job_type=? AND source_file_id=? AND import_plan_id=?
-             AND source_modified_time=? AND source_size_bytes=?
-           ORDER BY id DESC LIMIT 1""",
-        ("SAMPLE", file_id, plan_id, modified_time, size),
-    ).fetchone()
-
-
-@app.post("/api/sample-import/{file_id}")
-def sample_import(file_id: str, request: Request):
-    if not is_admin(request):
-        raise HTTPException(403)
-    if not re.fullmatch(r"[-\w]{10,}", file_id):
-        raise HTTPException(400, "file_id לא תקין")
-
+def _claim_sample_job(job_id):
+    """Atomic DB claim: exactly one background execution can move pending -> running."""
     c = db()
-    plan_row = _sample_plan(c, file_id)
-    if not plan_row or plan_row["status"] != "approved_for_import":
-        c.close()
-        return JSONResponse({"ok": False, "error": "לא נמצא Import Plan מאושר"}, status_code=400)
-    plan = plan_row["plan"]
-    source = c.execute("SELECT modified_time,size,name FROM drive_sources WHERE file_id=? ORDER BY id DESC LIMIT 1", (file_id,)).fetchone()
-    if not source:
-        c.close()
-        return JSONResponse({"ok": False, "error": "הקובץ לא נמצא ב-Discovery"}, status_code=400)
-    modified_time, size, source_name = source[0], source[1], source[2]
-    if str(plan.get("file", {}).get("modifiedTime", "")) != str(modified_time or "") or str(plan.get("file", {}).get("size", "")) != str(size or ""):
-        c.close()
-        return JSONResponse({"ok": False, "error": "Import Plan ישן: מקור הקובץ השתנה מאז האישור", "source_matches": False}, status_code=409)
-
-    existing = _sample_existing(c, file_id, plan_row["id"], modified_time, size)
-    if existing and existing[1] == "running":
-        # Sample execution is synchronous; a deploy/timeout may orphan its row.
-        # A new explicit request safely replaces the orphan before retrying.
-        c.execute("DELETE FROM raw_records_metadata WHERE job_id=?", (existing[0],))
-        c.execute("DELETE FROM import_history WHERE job_id=?", (existing[0],))
-        c.execute("DELETE FROM import_jobs WHERE id=?", (existing[0],))
-        c.commit()
-        existing = None
-    if existing and existing[1] == "completed":
-        c.close()
-        return {"ok": True, "idempotent": True, "message": "Sample Import כבר קיים עבור אותה גרסת מקור ו-Plan", "job": dict(existing)}
-    if existing and existing[1] == "failed":
-        c.execute("DELETE FROM raw_records_metadata WHERE job_id=?", (existing[0],))
-        c.execute("DELETE FROM import_history WHERE job_id=?", (existing[0],))
-        c.execute("DELETE FROM import_jobs WHERE id=?", (existing[0],))
-        c.commit()
-
-    c.execute(
-        """INSERT INTO import_jobs(dataset_id,import_plan_id,job_type,status,requested_by,source_file_id,source_modified_time,source_size_bytes)
-           VALUES(NULL,?,?,?,?,?,?,?)""",
-        (plan_row["id"], "SAMPLE", "pending", "admin", file_id, modified_time, size),
-    )
-    job_id = c.execute("SELECT MAX(id) FROM import_jobs WHERE source_file_id=? AND job_type=?", (file_id, "SAMPLE")).fetchone()[0]
+    row = c.execute("UPDATE import_jobs SET status=?,started_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE id=? AND status=? RETURNING id", ("running", job_id, "pending")).fetchone()
     c.commit()
     c.close()
+    return bool(row)
 
-    c = db()
-    c.execute("UPDATE import_jobs SET status=?,started_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE id=?", ("running", job_id))
-    c.commit()
-    c.close()
 
+def _run_sample_job(job_id, file_id, refresh_token):
+    """Durable worker invoked after the HTTP response; it never owns an HTTP request."""
+    if not _claim_sample_job(job_id):
+        return
     downloaded_bytes = 0
     rows_read = rows_written = rows_failed = 0
     errors = []
-    full_file_downloaded = False
-    import tempfile
     try:
-        service, error_response = _sample_service(request)
-        if error_response:
-            raise RuntimeError("Google OAuth עדיין לא מחובר")
+        c = db()
+        plan_row = c.execute("SELECT id,plan_json FROM import_plans WHERE file_id=? AND status=? ORDER BY plan_version DESC,id DESC LIMIT 1", (file_id, "approved_for_import")).fetchone()
+        source = c.execute("SELECT modified_time,size,name FROM drive_sources WHERE file_id=? ORDER BY id DESC LIMIT 1", (file_id,)).fetchone()
+        c.close()
+        if not plan_row or not source:
+            raise RuntimeError("Import Plan או Discovery חסרים")
+        plan = json_value(plan_row[1]) or {}
+        if str(plan.get("file", {}).get("modifiedTime", "")) != str(source[0] or "") or str(plan.get("file", {}).get("size", "")) != str(source[1] or ""):
+            raise RuntimeError("Import Plan ישן: מקור הקובץ השתנה מאז האישור")
+        service = _sample_service_from_refresh(refresh_token)
         meta = service.files().get(fileId=file_id, fields="id,name,mimeType,size,modifiedTime", supportsAllDrives=True).execute()
         delimiter = str(plan.get("file", {}).get("delimiter", ":"))
         encoding = str(plan.get("file", {}).get("encoding", "utf-8-sig")) or "utf-8-sig"
         mappings = plan.get("mappings", [])
+        import tempfile
         with tempfile.TemporaryFile(mode="w+b") as spool:
             downloader = MediaIoBaseDownload(spool, service.files().get_media(fileId=file_id, acknowledgeAbuse=False), chunksize=1024 * 1024)
             done = False
@@ -3236,6 +3204,7 @@ def sample_import(file_id: str, request: Request):
             spool.seek(0)
             text = io.TextIOWrapper(spool, encoding=encoding, errors="replace", newline="")
             c = db()
+            rows_written = int(c.execute("SELECT COUNT(*) FROM raw_records_metadata WHERE job_id=?", (job_id,)).fetchone()[0])
             for row_number, line in enumerate(text, start=1):
                 if rows_read >= SAMPLE_MAX_ROWS:
                     break
@@ -3247,12 +3216,10 @@ def sample_import(file_id: str, request: Request):
                     raw_json = json.dumps(raw_values, ensure_ascii=False, separators=(",", ":"))
                     normalized_json = json.dumps({"values": normalized, "transformations": transformations}, ensure_ascii=False, separators=(",", ":")) if normalized else None
                     record_hash = hashlib.sha256(raw_json.encode("utf-8")).hexdigest()
-                    c.execute(
-                        """INSERT INTO raw_records_metadata(dataset_id,job_id,row_number,record_hash,record_status,parse_status,raw_values_json,normalized_values_json,source_file_id,import_job_id)
-                           VALUES(NULL,?,?,?,?,?,?,?,?,?)""",
-                        (job_id, row_number, record_hash, "sample", "ok", raw_json, normalized_json, file_id, job_id),
-                    )
-                    rows_written += 1
+                    prior = c.execute("SELECT 1 FROM raw_records_metadata WHERE job_id=? AND row_number=?", (job_id, row_number)).fetchone()
+                    if not prior:
+                        c.execute("""INSERT INTO raw_records_metadata(dataset_id,job_id,row_number,record_hash,record_status,parse_status,raw_values_json,normalized_values_json,source_file_id,import_job_id) VALUES(NULL,?,?,?,?,?,?,?,?,?) ON CONFLICT(job_id,row_number) DO NOTHING""", (job_id, row_number, record_hash, "sample", "ok", raw_json, normalized_json, file_id, job_id))
+                        rows_written += 1
                 except Exception as row_error:
                     rows_failed += 1
                     error = {"row_number": row_number, "error_type": type(row_error).__name__, "error": str(row_error)}
@@ -3260,19 +3227,75 @@ def sample_import(file_id: str, request: Request):
                     c.execute("INSERT INTO import_history(job_id,event_type,event_payload_json,actor) VALUES(?,?,?,?)", (job_id, "parse_error", json.dumps(error, ensure_ascii=False), "sample_import"))
             c.commit()
             c.close()
-
         c = db()
-        c.execute("""UPDATE import_jobs SET status=?,rows_read=?,rows_written=?,rows_failed=?,bytes_read=?,finished_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP,last_error=? WHERE id=?""", ("completed", rows_read, rows_written, rows_failed, downloaded_bytes, json.dumps(errors[:20], ensure_ascii=False) if errors else None, job_id))
+        c.execute("UPDATE import_jobs SET status=?,rows_read=?,rows_written=?,rows_failed=?,bytes_read=?,finished_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP,last_error=? WHERE id=?", ("completed", rows_read, rows_written, rows_failed, downloaded_bytes, json.dumps(errors[:20], ensure_ascii=False) if errors else None, job_id))
         c.execute("INSERT INTO import_history(job_id,event_type,event_payload_json,actor) VALUES(?,?,?,?)", (job_id, "sample_completed", json.dumps({"rows_written": rows_written, "bytes_read": downloaded_bytes, "full_file_downloaded": False, "parser_version": SAMPLE_PARSER_VERSION}, ensure_ascii=False), "sample_import"))
         c.commit()
         c.close()
-        return {"ok": True, "idempotent": False, "job": {"id": job_id, "status": "completed", "job_type": "SAMPLE", "rows_read": rows_read, "rows_written": rows_written, "rows_failed": rows_failed, "bytes_read": downloaded_bytes, "sample_limit_rows": SAMPLE_MAX_ROWS, "sample_limit_bytes": SAMPLE_MAX_BYTES, "sample_ceiling_bytes": SAMPLE_MAX_BYTES_CEILING, "full_file_downloaded": full_file_downloaded, "source_file_id": file_id, "file_name": meta.get("name"), "parser_version": SAMPLE_PARSER_VERSION}, "errors": errors[:20]}
     except Exception as exc:
         c = db()
         c.execute("UPDATE import_jobs SET status=?,rows_read=?,rows_written=?,rows_failed=?,bytes_read=?,finished_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP,last_error=? WHERE id=?", ("failed", rows_read, rows_written, rows_failed, downloaded_bytes, str(exc)[:2000], job_id))
         c.commit()
         c.close()
-        return JSONResponse({"ok": False, "job_id": job_id, "status": "failed", "rows_read": rows_read, "rows_written": rows_written, "rows_failed": rows_failed, "bytes_read": downloaded_bytes, "full_file_downloaded": False, "error_type": type(exc).__name__, "error": str(exc)}, status_code=500)
+
+
+@app.post("/api/sample-import/{file_id}")
+def sample_import(file_id: str, request: Request, background_tasks: BackgroundTasks):
+    """Create only a durable pending Job and return immediately."""
+    if not is_admin(request):
+        raise HTTPException(403)
+    if not re.fullmatch(r"[-\w]{10,}", file_id):
+        raise HTTPException(400, "file_id לא תקין")
+    c = db()
+    plan_row = c.execute("SELECT id,file_name,status,plan_json,source_modified_time,source_size_bytes FROM import_plans WHERE file_id=? ORDER BY plan_version DESC,id DESC LIMIT 1", (file_id,)).fetchone()
+    source = c.execute("SELECT modified_time,size,name FROM drive_sources WHERE file_id=? ORDER BY id DESC LIMIT 1", (file_id,)).fetchone()
+    if not plan_row or plan_row[2] != "approved_for_import":
+        c.close(); return JSONResponse({"ok": False, "error": "לא נמצא Import Plan מאושר"}, status_code=400)
+    if not source:
+        c.close(); return JSONResponse({"ok": False, "error": "הקובץ לא נמצא ב-Discovery"}, status_code=400)
+    plan = json_value(plan_row[3]) or {}
+    if str(plan.get("file", {}).get("modifiedTime", "")) != str(source[0] or "") or str(plan.get("file", {}).get("size", "")) != str(source[1] or ""):
+        c.close(); return JSONResponse({"ok": False, "error": "Import Plan ישן: מקור הקובץ השתנה מאז האישור", "source_matches": False}, status_code=409)
+    existing = c.execute("SELECT id,status,rows_read,rows_written,rows_failed,bytes_read,last_error,full_file_downloaded FROM import_jobs WHERE job_type=? AND source_file_id=? AND import_plan_id=? AND source_modified_time=? AND source_size_bytes=? ORDER BY id DESC LIMIT 1", ("SAMPLE", file_id, plan_row[0], source[0], source[1])).fetchone()
+    if existing:
+        c.close(); return {"ok": True, "created": False, "idempotent": True, "job": dict(existing)}
+    row = c.execute("INSERT INTO import_jobs(dataset_id,import_plan_id,job_type,status,requested_by,source_file_id,source_modified_time,source_size_bytes) VALUES(NULL,?,?,?,?,?,?,?) RETURNING id", (plan_row[0], "SAMPLE", "pending", "admin", file_id, source[0], source[1])).fetchone()
+    job_id = row[0]
+    c.commit(); c.close()
+    refresh_token = refresh_token_from_request(request)
+    background_tasks.add_task(_run_sample_job, job_id, file_id, refresh_token)
+    return {"ok": True, "created": True, "idempotent": False, "job": {"id": job_id, "status": "pending", "job_type": "SAMPLE", "source_file_id": file_id, "sample_limit_rows": SAMPLE_MAX_ROWS, "sample_limit_bytes": SAMPLE_MAX_BYTES, "full_file_downloaded": False}}
+
+
+@app.post("/api/sample-import/recover")
+def recover_sample_jobs(request: Request):
+    """Mark orphaned running jobs failed/recoverable; does not create or execute a Job."""
+    if not is_admin(request):
+        raise HTTPException(403)
+    c = db()
+    rows = c.execute("SELECT id FROM import_jobs WHERE job_type=? AND status=?", ("SAMPLE", "running")).fetchall()
+    recovered = []
+    for row in rows:
+        c.execute("UPDATE import_jobs SET status=?,finished_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP,last_error=? WHERE id=? AND status=?", ("failed", "orphaned_background_worker_recoverable", row[0], "running"))
+        recovered.append(row[0])
+    c.commit(); c.close()
+    return {"ok": True, "created": False, "recovered_job_ids": recovered, "count": len(recovered)}
+
+
+@app.post("/api/sample-import/{file_id}/retry")
+def retry_sample_import(file_id: str, request: Request, background_tasks: BackgroundTasks):
+    """Requeue the same failed/recoverable Job; never creates a duplicate Job or deletes records."""
+    if not is_admin(request):
+        raise HTTPException(403)
+    c = db()
+    row = c.execute("SELECT id,status,last_error FROM import_jobs WHERE source_file_id=? AND job_type=? ORDER BY id DESC LIMIT 1", (file_id, "SAMPLE")).fetchone()
+    if not row or row[1] != "failed":
+        c.close()
+        return JSONResponse({"ok": False, "error": "אין Sample Job שניתן לנסות מחדש"}, status_code=409)
+    c.execute("UPDATE import_jobs SET status=?,finished_at=NULL,updated_at=CURRENT_TIMESTAMP,last_error=NULL WHERE id=? AND status=?", ("pending", row[0], "failed"))
+    c.commit(); c.close()
+    background_tasks.add_task(_run_sample_job, row[0], file_id, refresh_token_from_request(request))
+    return {"ok": True, "created": False, "reused_job_id": row[0], "job": {"id": row[0], "status": "pending"}}
 
 
 @app.get("/api/sample-import/{file_id}/status")
