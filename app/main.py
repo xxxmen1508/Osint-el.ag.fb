@@ -3183,17 +3183,8 @@ def sample_import(file_id: str, request: Request):
 
     existing = _sample_existing(c, file_id, plan_row["id"], modified_time, size)
     if existing and existing[1] == "running":
-        # A synchronous Render request can be terminated by a deploy or timeout.
-        # Permit recovery only after a conservative stale window.
-        started = str(c.execute("SELECT started_at FROM import_jobs WHERE id=?", (existing[0],)).fetchone()[0] or "")
-        from datetime import datetime, timezone
-        try:
-            age = (datetime.now(timezone.utc) - datetime.fromisoformat(started.replace("Z", "+00:00"))).total_seconds()
-        except Exception:
-            age = 0
-        if age < 600:
-            c.close()
-            return {"ok": True, "idempotent": True, "message": "Sample Import כבר רץ עבור אותה גרסת מקור ו-Plan", "job": dict(existing)}
+        # Sample execution is synchronous; a deploy/timeout may orphan its row.
+        # A new explicit request safely replaces the orphan before retrying.
         c.execute("DELETE FROM raw_records_metadata WHERE job_id=?", (existing[0],))
         c.execute("DELETE FROM import_history WHERE job_id=?", (existing[0],))
         c.execute("DELETE FROM import_jobs WHERE id=?", (existing[0],))
