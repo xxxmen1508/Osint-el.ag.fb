@@ -3105,7 +3105,8 @@ def analyze_drive_file(
 # ============================================================
 
 SAMPLE_MAX_ROWS = 10_000
-SAMPLE_MAX_BYTES = 50 * 1024 * 1024
+SAMPLE_MAX_BYTES = 4 * 1024 * 1024
+SAMPLE_MAX_BYTES_CEILING = 50 * 1024 * 1024
 SAMPLE_PARSER_VERSION = "sample-stream-v1"
 
 
@@ -3181,7 +3182,24 @@ def sample_import(file_id: str, request: Request):
         return JSONResponse({"ok": False, "error": "Import Plan ישן: מקור הקובץ השתנה מאז האישור", "source_matches": False}, status_code=409)
 
     existing = _sample_existing(c, file_id, plan_row["id"], modified_time, size)
-    if existing and existing[1] in ("running", "completed"):
+    if existing and existing[1] == "running":
+        # A synchronous Render request can be terminated by a deploy or timeout.
+        # Permit recovery only after a conservative stale window.
+        started = str(c.execute("SELECT started_at FROM import_jobs WHERE id=?", (existing[0],)).fetchone()[0] or "")
+        from datetime import datetime, timezone
+        try:
+            age = (datetime.now(timezone.utc) - datetime.fromisoformat(started.replace("Z", "+00:00"))).total_seconds()
+        except Exception:
+            age = 0
+        if age < 600:
+            c.close()
+            return {"ok": True, "idempotent": True, "message": "Sample Import כבר רץ עבור אותה גרסת מקור ו-Plan", "job": dict(existing)}
+        c.execute("DELETE FROM raw_records_metadata WHERE job_id=?", (existing[0],))
+        c.execute("DELETE FROM import_history WHERE job_id=?", (existing[0],))
+        c.execute("DELETE FROM import_jobs WHERE id=?", (existing[0],))
+        c.commit()
+        existing = None
+    if existing and existing[1] == "completed":
         c.close()
         return {"ok": True, "idempotent": True, "message": "Sample Import כבר קיים עבור אותה גרסת מקור ו-Plan", "job": dict(existing)}
     if existing and existing[1] == "failed":
@@ -3257,7 +3275,7 @@ def sample_import(file_id: str, request: Request):
         c.execute("INSERT INTO import_history(job_id,event_type,event_payload_json,actor) VALUES(?,?,?,?)", (job_id, "sample_completed", json.dumps({"rows_written": rows_written, "bytes_read": downloaded_bytes, "full_file_downloaded": False, "parser_version": SAMPLE_PARSER_VERSION}, ensure_ascii=False), "sample_import"))
         c.commit()
         c.close()
-        return {"ok": True, "idempotent": False, "job": {"id": job_id, "status": "completed", "job_type": "SAMPLE", "rows_read": rows_read, "rows_written": rows_written, "rows_failed": rows_failed, "bytes_read": downloaded_bytes, "sample_limit_rows": SAMPLE_MAX_ROWS, "sample_limit_bytes": SAMPLE_MAX_BYTES, "full_file_downloaded": full_file_downloaded, "source_file_id": file_id, "file_name": meta.get("name"), "parser_version": SAMPLE_PARSER_VERSION}, "errors": errors[:20]}
+        return {"ok": True, "idempotent": False, "job": {"id": job_id, "status": "completed", "job_type": "SAMPLE", "rows_read": rows_read, "rows_written": rows_written, "rows_failed": rows_failed, "bytes_read": downloaded_bytes, "sample_limit_rows": SAMPLE_MAX_ROWS, "sample_limit_bytes": SAMPLE_MAX_BYTES, "sample_ceiling_bytes": SAMPLE_MAX_BYTES_CEILING, "full_file_downloaded": full_file_downloaded, "source_file_id": file_id, "file_name": meta.get("name"), "parser_version": SAMPLE_PARSER_VERSION}, "errors": errors[:20]}
     except Exception as exc:
         c = db()
         c.execute("UPDATE import_jobs SET status=?,rows_read=?,rows_written=?,rows_failed=?,bytes_read=?,finished_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP,last_error=? WHERE id=?", ("failed", rows_read, rows_written, rows_failed, downloaded_bytes, str(exc)[:2000], job_id))
