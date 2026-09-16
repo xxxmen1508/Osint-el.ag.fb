@@ -91,6 +91,7 @@ def _split_sql(sql):
 
 
 def _sqlite_schema(sql):
+    sql = re.sub(r"ADD\s+COLUMN\s+IF\s+NOT\s+EXISTS", "ADD COLUMN", sql, flags=re.I)
     sql = re.sub(r"\bBIGSERIAL\b", "INTEGER", sql, flags=re.I)
     sql = re.sub(r"\bSERIAL\b", "INTEGER", sql, flags=re.I)
     sql = re.sub(r"\bBIGINT\b", "INTEGER", sql, flags=re.I)
@@ -107,15 +108,26 @@ def _migration_text():
     return (MIGRATIONS_DIR / "001_initial.sql").read_text(encoding="utf-8")
 
 
+def _migrations():
+    return sorted(MIGRATIONS_DIR.glob("*.sql"))
+
+
 def run_migrations(db):
     db.execute("CREATE TABLE IF NOT EXISTS schema_migrations (version TEXT PRIMARY KEY, applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
     db.commit()
-    version = "001_initial"
-    exists = db.execute("SELECT version FROM schema_migrations WHERE version=?", (version,)).fetchone()
-    if not exists:
-        db.executescript(_migration_text())
-        db.execute("INSERT INTO schema_migrations(version) VALUES(?)", (version,))
-        db.commit()
+    for migration in _migrations():
+        version = migration.stem
+        exists = db.execute("SELECT version FROM schema_migrations WHERE version=?", (version,)).fetchone()
+        if not exists:
+            sql = migration.read_text(encoding="utf-8")
+            if db.postgres:
+                for statement in _split_sql(sql):
+                    if statement.strip():
+                        db.execute(statement)
+            else:
+                db.executescript(_sqlite_schema(sql))
+            db.execute("INSERT INTO schema_migrations(version) VALUES(?)", (version,))
+            db.commit()
 
 
 def _sqlite_connection():
@@ -123,7 +135,6 @@ def _sqlite_connection():
     connection = sqlite3.connect(SQLITE_PATH)
     connection.row_factory = sqlite3.Row
     db = Database(connection, postgres=False)
-    db.executescript(_sqlite_schema(_migration_text()))
     run_migrations(db)
     return db
 
