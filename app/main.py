@@ -3181,9 +3181,14 @@ def sample_import(file_id: str, request: Request):
         return JSONResponse({"ok": False, "error": "Import Plan ישן: מקור הקובץ השתנה מאז האישור", "source_matches": False}, status_code=409)
 
     existing = _sample_existing(c, file_id, plan_row["id"], modified_time, size)
-    if existing:
+    if existing and existing[1] in ("running", "completed"):
         c.close()
         return {"ok": True, "idempotent": True, "message": "Sample Import כבר קיים עבור אותה גרסת מקור ו-Plan", "job": dict(existing)}
+    if existing and existing[1] == "failed":
+        c.execute("DELETE FROM raw_records_metadata WHERE job_id=?", (existing[0],))
+        c.execute("DELETE FROM import_history WHERE job_id=?", (existing[0],))
+        c.execute("DELETE FROM import_jobs WHERE id=?", (existing[0],))
+        c.commit()
 
     c.execute(
         """INSERT INTO import_jobs(dataset_id,import_plan_id,job_type,status,requested_by,source_file_id,source_modified_time,source_size_bytes)
@@ -3221,13 +3226,13 @@ def sample_import(file_id: str, request: Request):
             spool.flush()
             spool.seek(0)
             text = io.TextIOWrapper(spool, encoding=encoding, errors="replace", newline="")
-            reader = csv.reader(text, delimiter=delimiter, strict=True)
             c = db()
-            for row_number, values in enumerate(reader, start=1):
+            for row_number, line in enumerate(text, start=1):
                 if rows_read >= SAMPLE_MAX_ROWS:
                     break
                 rows_read += 1
                 try:
+                    values = next(csv.reader([line], delimiter=delimiter, strict=True))
                     raw_values = {str(i + 1): str(v) for i, v in enumerate(values)}
                     normalized, transformations = _sample_normalized(values, mappings)
                     raw_json = json.dumps(raw_values, ensure_ascii=False, separators=(",", ":"))
