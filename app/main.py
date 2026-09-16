@@ -3099,6 +3099,180 @@ def analyze_drive_file(
         )
 
 
+
+# ============================================================
+# SAMPLE IMPORT (streaming, metadata/raw-values only)
+# ============================================================
+
+SAMPLE_MAX_ROWS = 10_000
+SAMPLE_MAX_BYTES = 50 * 1024 * 1024
+SAMPLE_PARSER_VERSION = "sample-stream-v1"
+
+
+def _sample_normalized(values, mappings):
+    normalized = {}
+    transformations = {}
+    for mapping in mappings:
+        idx = int(mapping.get("column_index", 0))
+        meaning = str(mapping.get("meaning", "ignore"))
+        if idx < 1 or idx > len(values) or meaning == "ignore":
+            continue
+        value = str(values[idx - 1])
+        if not value:
+            continue
+        if meaning == "phone":
+            normalized[meaning] = re.sub(r"[^0-9]+", "", value)
+            transformations[meaning] = "digits_only_deterministic"
+        elif meaning == "email":
+            normalized[meaning] = value.strip().lower()
+            transformations[meaning] = "trim_lowercase_deterministic"
+    return normalized, transformations
+
+
+def _sample_service(request):
+    creds = credentials_from_request(request)
+    if not creds:
+        return None, JSONResponse({"ok": False, "message": "Google OAuth עדיין לא מחובר"}, status_code=400)
+    from google.auth.transport.requests import Request as GoogleRequest
+    if not creds.valid:
+        creds.refresh(GoogleRequest())
+    return build("drive", "v3", credentials=creds, cache_discovery=False), None
+
+
+def _sample_plan(c, file_id):
+    row = c.execute("SELECT id,file_name,status,plan_json,source_modified_time,source_size_bytes FROM import_plans WHERE file_id=? ORDER BY plan_version DESC,id DESC LIMIT 1", (file_id,)).fetchone()
+    if not row:
+        return None
+    plan = json_value(row[3]) or {}
+    return {"id": row[0], "file_name": row[1], "status": row[2], "plan": plan, "modified_time": row[4], "size": row[5]}
+
+
+def _sample_existing(c, file_id, plan_id, modified_time, size):
+    return c.execute(
+        """SELECT id,status,rows_read,rows_written,rows_failed,bytes_read,last_error,full_file_downloaded
+           FROM import_jobs
+           WHERE job_type=? AND source_file_id=? AND import_plan_id=?
+             AND source_modified_time=? AND source_size_bytes=?
+           ORDER BY id DESC LIMIT 1""",
+        ("SAMPLE", file_id, plan_id, modified_time, size),
+    ).fetchone()
+
+
+@app.post("/api/sample-import/{file_id}")
+def sample_import(file_id: str, request: Request):
+    if not is_admin(request):
+        raise HTTPException(403)
+    if not re.fullmatch(r"[-\w]{10,}", file_id):
+        raise HTTPException(400, "file_id לא תקין")
+
+    c = db()
+    plan_row = _sample_plan(c, file_id)
+    if not plan_row or plan_row["status"] != "approved_for_import":
+        c.close()
+        return JSONResponse({"ok": False, "error": "לא נמצא Import Plan מאושר"}, status_code=400)
+    plan = plan_row["plan"]
+    source = c.execute("SELECT modified_time,size,name FROM drive_sources WHERE file_id=? ORDER BY id DESC LIMIT 1", (file_id,)).fetchone()
+    if not source:
+        c.close()
+        return JSONResponse({"ok": False, "error": "הקובץ לא נמצא ב-Discovery"}, status_code=400)
+    modified_time, size, source_name = source[0], source[1], source[2]
+    if str(plan.get("file", {}).get("modifiedTime", "")) != str(modified_time or "") or str(plan.get("file", {}).get("size", "")) != str(size or ""):
+        c.close()
+        return JSONResponse({"ok": False, "error": "Import Plan ישן: מקור הקובץ השתנה מאז האישור", "source_matches": False}, status_code=409)
+
+    existing = _sample_existing(c, file_id, plan_row["id"], modified_time, size)
+    if existing:
+        c.close()
+        return {"ok": True, "idempotent": True, "message": "Sample Import כבר קיים עבור אותה גרסת מקור ו-Plan", "job": dict(existing)}
+
+    c.execute(
+        """INSERT INTO import_jobs(dataset_id,import_plan_id,job_type,status,requested_by,source_file_id,source_modified_time,source_size_bytes)
+           VALUES(NULL,?,?,?,?,?,?,?)""",
+        (plan_row["id"], "SAMPLE", "pending", "admin", file_id, modified_time, size),
+    )
+    job_id = c.execute("SELECT MAX(id) FROM import_jobs WHERE source_file_id=? AND job_type=?", (file_id, "SAMPLE")).fetchone()[0]
+    c.commit()
+    c.close()
+
+    c = db()
+    c.execute("UPDATE import_jobs SET status=?,started_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE id=?", ("running", job_id))
+    c.commit()
+    c.close()
+
+    downloaded_bytes = 0
+    rows_read = rows_written = rows_failed = 0
+    errors = []
+    full_file_downloaded = False
+    import tempfile
+    try:
+        service, error_response = _sample_service(request)
+        if error_response:
+            raise RuntimeError("Google OAuth עדיין לא מחובר")
+        meta = service.files().get(fileId=file_id, fields="id,name,mimeType,size,modifiedTime", supportsAllDrives=True).execute()
+        delimiter = str(plan.get("file", {}).get("delimiter", ":"))
+        encoding = str(plan.get("file", {}).get("encoding", "utf-8-sig")) or "utf-8-sig"
+        mappings = plan.get("mappings", [])
+        with tempfile.TemporaryFile(mode="w+b") as spool:
+            downloader = MediaIoBaseDownload(spool, service.files().get_media(fileId=file_id, acknowledgeAbuse=False), chunksize=1024 * 1024)
+            done = False
+            while not done and downloaded_bytes < SAMPLE_MAX_BYTES:
+                _, done = downloader.next_chunk()
+                downloaded_bytes = spool.tell()
+            spool.flush()
+            spool.seek(0)
+            text = io.TextIOWrapper(spool, encoding=encoding, errors="replace", newline="")
+            reader = csv.reader(text, delimiter=delimiter, strict=True)
+            c = db()
+            for row_number, values in enumerate(reader, start=1):
+                if rows_read >= SAMPLE_MAX_ROWS:
+                    break
+                rows_read += 1
+                try:
+                    raw_values = {str(i + 1): str(v) for i, v in enumerate(values)}
+                    normalized, transformations = _sample_normalized(values, mappings)
+                    raw_json = json.dumps(raw_values, ensure_ascii=False, separators=(",", ":"))
+                    normalized_json = json.dumps({"values": normalized, "transformations": transformations}, ensure_ascii=False, separators=(",", ":")) if normalized else None
+                    record_hash = hashlib.sha256(raw_json.encode("utf-8")).hexdigest()
+                    c.execute(
+                        """INSERT INTO raw_records_metadata(dataset_id,job_id,row_number,record_hash,record_status,parse_status,raw_values_json,normalized_values_json,source_file_id,import_job_id)
+                           VALUES(NULL,?,?,?,?,?,?,?,?,?)""",
+                        (job_id, row_number, record_hash, "sample", "ok", raw_json, normalized_json, file_id, job_id),
+                    )
+                    rows_written += 1
+                except Exception as row_error:
+                    rows_failed += 1
+                    error = {"row_number": row_number, "error_type": type(row_error).__name__, "error": str(row_error)}
+                    errors.append(error)
+                    c.execute("INSERT INTO import_history(job_id,event_type,event_payload_json,actor) VALUES(?,?,?,?)", (job_id, "parse_error", json.dumps(error, ensure_ascii=False), "sample_import"))
+            c.commit()
+            c.close()
+
+        c = db()
+        c.execute("""UPDATE import_jobs SET status=?,rows_read=?,rows_written=?,rows_failed=?,bytes_read=?,finished_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP,last_error=? WHERE id=?""", ("completed", rows_read, rows_written, rows_failed, downloaded_bytes, json.dumps(errors[:20], ensure_ascii=False) if errors else None, job_id))
+        c.execute("INSERT INTO import_history(job_id,event_type,event_payload_json,actor) VALUES(?,?,?,?)", (job_id, "sample_completed", json.dumps({"rows_written": rows_written, "bytes_read": downloaded_bytes, "full_file_downloaded": False, "parser_version": SAMPLE_PARSER_VERSION}, ensure_ascii=False), "sample_import"))
+        c.commit()
+        c.close()
+        return {"ok": True, "idempotent": False, "job": {"id": job_id, "status": "completed", "job_type": "SAMPLE", "rows_read": rows_read, "rows_written": rows_written, "rows_failed": rows_failed, "bytes_read": downloaded_bytes, "sample_limit_rows": SAMPLE_MAX_ROWS, "sample_limit_bytes": SAMPLE_MAX_BYTES, "full_file_downloaded": full_file_downloaded, "source_file_id": file_id, "file_name": meta.get("name"), "parser_version": SAMPLE_PARSER_VERSION}, "errors": errors[:20]}
+    except Exception as exc:
+        c = db()
+        c.execute("UPDATE import_jobs SET status=?,rows_read=?,rows_written=?,rows_failed=?,bytes_read=?,finished_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP,last_error=? WHERE id=?", ("failed", rows_read, rows_written, rows_failed, downloaded_bytes, str(exc)[:2000], job_id))
+        c.commit()
+        c.close()
+        return JSONResponse({"ok": False, "job_id": job_id, "status": "failed", "rows_read": rows_read, "rows_written": rows_written, "rows_failed": rows_failed, "bytes_read": downloaded_bytes, "full_file_downloaded": False, "error_type": type(exc).__name__, "error": str(exc)}, status_code=500)
+
+
+@app.get("/api/sample-import/{file_id}/status")
+def sample_import_status(file_id: str, request: Request):
+    if not is_admin(request):
+        raise HTTPException(403)
+    c = db()
+    job = c.execute("SELECT id,status,job_type,source_file_id,rows_read,rows_written,rows_failed,bytes_read,last_error,started_at,finished_at,created_at FROM import_jobs WHERE source_file_id=? AND job_type=? ORDER BY id DESC LIMIT 1", (file_id, "SAMPLE")).fetchone()
+    records = []
+    if job:
+        records = [dict(row) for row in c.execute("SELECT row_number,source_file_id,raw_values_json,normalized_values_json,record_hash,parse_status FROM raw_records_metadata WHERE job_id=? ORDER BY row_number LIMIT 5", (job[0],)).fetchall()]
+    c.close()
+    return {"ok": True, "job": dict(job) if job else None, "sample_records_preview": records, "full_file_downloaded": False}
+
 # ============================================================
 # STATUS
 # ============================================================

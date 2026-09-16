@@ -874,6 +874,10 @@ function escapeHtml(value){
   <button id="v7-save-plan" onclick="v7SavePlan()" style="display:none;margin-top:12px">
     ✅ אשר מיפוי ושמור Import Plan
   </button>
+  <button id="sample-import-button" onclick="runSampleImport()" style="margin-top:12px">
+    ▶️ הרץ Sample Import — עד 10,000 רשומות / 50MB
+  </button>
+  <pre id="sample-import-result" style="margin-top:12px"></pre>
 </section>
 
 <script>
@@ -1024,6 +1028,21 @@ async function v7SavePlan() {
   } catch (e) {
     status.textContent = "❌ שגיאה בשמירת Import Plan: " + e.message;
   }
+}
+async function runSampleImport() {
+  const fileId = document.getElementById("v7-file-id").value.trim();
+  const button = document.getElementById("sample-import-button");
+  const output = document.getElementById("sample-import-result");
+  if (!fileId) { output.textContent = "❌ הזן File ID של Facebook.txt."; return; }
+  button.disabled = true;
+  output.textContent = "⏳ מריץ Sample Import סטרימינג...";
+  try {
+    const r = await fetch("/api/sample-import/" + encodeURIComponent(fileId), {method:"POST"});
+    const data = await r.json();
+    output.textContent = JSON.stringify(data, null, 2);
+  } catch (e) {
+    output.textContent = "❌ שגיאה: " + e.message;
+  } finally { button.disabled = false; }
 }
 </script>
 
