@@ -2674,6 +2674,126 @@ def analyze_sample_bytes(raw, total_size):
     }
 
 
+
+def _parse_diagnostic_variant(line, quotechar='"', escapechar=None, doublequote=True):
+    try:
+        kwargs = {"delimiter": ",", "strict": True, "doublequote": doublequote}
+        if quotechar is not None:
+            kwargs["quotechar"] = quotechar
+        else:
+            kwargs["quoting"] = csv.QUOTE_NONE
+        if escapechar is not None:
+            kwargs["escapechar"] = escapechar
+        values = next(csv.reader([line], **kwargs))
+        return {"ok": True, "field_count": len(values), "values": values, "error": None, "unbalanced_quotes": False}
+    except Exception as exc:
+        return {"ok": False, "field_count": None, "values": None, "error": str(exc), "unbalanced_quotes": True}
+
+
+def _run_parse_diagnostic(raw, total_size):
+    encoding, enc_conf = guess_encoding(raw)
+    text = raw.decode(encoding, errors="replace")
+    physical_lines = text.replace("\r\n", "\n").replace("\r", "\n").replace("\r", "\n").split("\n")
+    lines = [(n, line) for n, line in enumerate(physical_lines, 1) if line.strip()]
+    variants = {
+        "double_quote_default": {"quotechar": '"', "escapechar": None, "doublequote": True},
+        "single_quote": {"quotechar": "'", "escapechar": None, "doublequote": True},
+        "no_quote": {"quotechar": None, "escapechar": None, "doublequote": True},
+        "double_quote_backslash_escape": {"quotechar": '"', "escapechar": "\\", "doublequote": False},
+        "single_quote_backslash_escape": {"quotechar": "'", "escapechar": "\\", "doublequote": False},
+    }
+    results = {name: [] for name in variants}
+    for row_number, line in lines:
+        for name, cfg in variants.items():
+            results[name].append((row_number, line, _parse_diagnostic_variant(line, **cfg)))
+
+    counts = {}
+    for name, parsed in results.items():
+        dist = {}
+        errors = 0
+        for _, _, result in parsed:
+            key = "error" if not result["ok"] else str(result["field_count"])
+            dist[key] = dist.get(key, 0) + 1
+            errors += int(not result["ok"])
+        counts[name] = {"field_count_distribution": dist, "parse_errors": errors}
+
+    preferred = results["double_quote_default"]
+    problem_rows = []
+    for row_number, line, default_result in preferred:
+        if default_result["ok"] and default_result["field_count"] == 10:
+            continue
+        interpretations = {}
+        for name, parsed in results.items():
+            item = next(x[2] for x in parsed if x[0] == row_number)
+            interpretations[name] = {
+                "ok": item["ok"], "field_count": item["field_count"],
+                "error": item["error"], "unbalanced_quotes": item["unbalanced_quotes"],
+            }
+        problem_rows.append({
+            "row_number": row_number,
+            "raw_line": line,
+            "raw_line_length": len(line.encode(encoding, errors="replace")),
+            "current_parser": {"field_count": default_result["field_count"], "error": default_result["error"], "unbalanced_quotes": default_result["unbalanced_quotes"]},
+            "interpretations": interpretations,
+        })
+        if len(problem_rows) >= 10:
+            break
+
+    ambiguous = 0
+    for i in range(len(lines)):
+        fc = {results[name][i][2]["field_count"] for name in results if results[name][i][2]["ok"]}
+        if len(fc) > 1:
+            ambiguous += 1
+    return {
+        "status": "diagnostic_only",
+        "file_size": total_size,
+        "sample_bytes_read": len(raw),
+        "sample_limit_bytes": 4 * 1024 * 1024,
+        "full_file_downloaded": False,
+        "encoding": encoding,
+        "encoding_confidence": enc_conf,
+        "delimiter_tested": ",",
+        "rows_checked": len(lines),
+        "parser_variants": counts,
+        "ambiguous_rows_across_variants": ambiguous,
+        "problem_rows": problem_rows,
+        "requires_admin_review": True,
+        "note": "Diagnostic preserves raw physical lines and does not normalize, rewrite, persist, or import them.",
+    }
+
+
+@app.get("/api/drive/parse-diagnostics/{file_id}")
+def parse_diagnostics(file_id: str, request: Request):
+    if not is_admin(request):
+        raise HTTPException(403)
+    if not re.fullmatch(r"[-\w]{10,}", file_id):
+        raise HTTPException(400, "file_id לא תקין")
+    creds = credentials_from_request(request)
+    if not creds:
+        return JSONResponse({"ok": False, "message": "Google OAuth עדיין לא מחובר"}, status_code=400)
+    try:
+        from google.auth.transport.requests import Request as GoogleRequest
+        if not creds.valid:
+            creds.refresh(GoogleRequest())
+        service = build("drive", "v3", credentials=creds, cache_discovery=False)
+        meta = service.files().get(fileId=file_id, fields="id,name,mimeType,size,modifiedTime", supportsAllDrives=True).execute()
+        media = service.files().get_media(fileId=file_id, acknowledgeAbuse=False)
+        buf = io.BytesIO()
+        downloader = MediaIoBaseDownload(buf, media, chunksize=1024 * 1024)
+        done = False
+        limit = 4 * 1024 * 1024
+        while not done and buf.tell() < limit:
+            _, done = downloader.next_chunk()
+        buf.seek(0)
+        raw = buf.read()
+        buf.close()
+        result = _run_parse_diagnostic(raw, int(meta.get("size")) if meta.get("size") else None)
+        result.update({"ok": True, "file": meta})
+        return JSONResponse(result)
+    except Exception as exc:
+        return JSONResponse({"ok": False, "stage": "parse_diagnostics", "error_type": type(exc).__name__, "error": str(exc), "requires_admin_review": True}, status_code=500)
+
+
 # ============================================================
 # ANALYZE DRIVE FILE
 # ============================================================
