@@ -2514,249 +2514,163 @@ def positional_semantic_candidates(
     return filtered
 
 
-def analyze_sample_bytes(
-    raw,
-    total_size
-):
+def _header_token_score(value):
+    value = str(value or "").strip().strip("\"'")
+    if not value:
+        return 0.0
+    if re.match(r"^(https?://|@)", value, re.I):
+        return 0.0
+    if re.search(r"[A-Za-zא-ת]", value) and not re.search(r"\d", value):
+        return 1.0
+    return 0.0
 
-    encoding, enc_conf = guess_encoding(
-        raw
+
+def _find_table_header(parsed_lines, delimiter):
+    """Find the first plausible tabular header with consistent following rows."""
+    candidates = []
+    for pos, item in enumerate(parsed_lines):
+        row_number, row = item
+        if len(row) <= 1:
+            continue
+        header_score = sum(_header_token_score(v) for v in row) / len(row)
+        if header_score < 0.50:
+            continue
+        following = []
+        for next_item in parsed_lines[pos + 1:pos + 8]:
+            if len(next_item[1]) == len(row):
+                following.append(next_item[1])
+            if len(following) >= 3:
+                break
+        if len(following) < 2:
+            continue
+        # A real header has textual labels while the following rows are data-like
+        # or at least not all header-like labels.
+        follow_header_score = sum(
+            sum(_header_token_score(v) for v in r) / len(r)
+            for r in following
+        ) / len(following)
+        consistency = len(following) / 3.0
+        score = (header_score * 0.60) + (consistency * 0.40) - (follow_header_score * 0.10)
+        candidates.append({
+            "row_number": row_number,
+            "row": row,
+            "score": round(score, 4),
+            "following_consistent_rows": len(following),
+        })
+    candidates.sort(key=lambda x: (-x["score"], x["row_number"]))
+    return candidates
+
+
+def analyze_sample_bytes(raw, total_size):
+    encoding, enc_conf = guess_encoding(raw)
+    text = raw.decode(encoding, errors="replace")
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    nonempty = [(number, line) for number, line in enumerate(lines, 1) if line.strip()]
+    delimiter, delim_conf, detected_width = detect_delimiter([line for _, line in nonempty])
+
+    parsed_lines = []
+    parse_errors = []
+    for row_number, line in nonempty:
+        try:
+            if delimiter is None:
+                row = [line]
+            else:
+                row = next(csv.reader([line], delimiter=delimiter, strict=True))
+            parsed_lines.append((row_number, row))
+        except Exception as exc:
+            parse_errors.append({
+                "row_number": row_number,
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            })
+
+    if not parsed_lines:
+        raise ValueError("לא נמצאו שורות נתונים בדגימה")
+
+    header_candidates = _find_table_header(parsed_lines, delimiter)
+    header_info = header_candidates[0] if header_candidates else None
+    ambiguous_header = bool(
+        len(header_candidates) > 1
+        and abs(header_candidates[0]["score"] - header_candidates[1]["score"]) < 0.08
     )
 
-    text = raw.decode(
-        encoding,
-        errors="replace"
-    )
+    if header_info and not ambiguous_header:
+        header_row_number = header_info["row_number"]
+        header = header_info["row"]
+        header_pos = next(i for i, (n, _) in enumerate(parsed_lines) if n == header_row_number)
+        data_items = parsed_lines[header_pos + 1:]
+        width = len(header)
+        preamble_items = parsed_lines[:header_pos]
+    else:
+        header_row_number = None
+        header = None
+        data_items = parsed_lines
+        width = len(parsed_lines[0][1])
+        preamble_items = []
 
-    lines = (
-        text
-        .replace("\r\n", "\n")
-        .replace("\r", "\n")
-        .split("\n")
-    )
-
-    nonempty = [
-        x
-        for x in lines
-        if x.strip()
-    ]
-
-    delimiter, delim_conf, column_count = (
-        detect_delimiter(
-            nonempty
-        )
-    )
-
-    rows, parse_errors = parse_rows(
-        nonempty[:200],
-        delimiter
-    )
-
-    if not rows:
-
-        raise ValueError(
-            "לא נמצאו שורות נתונים בדגימה"
-        )
-
-    header = (
-        rows[0]
-        if looks_like_header(rows[0])
-        else None
-    )
-
-    data_rows = (
-        rows[1:]
-        if header
-        else rows
-    )
-
-    width = len(
-        header or rows[0]
-    )
-
-    names = (
-        [
-            normalize_header(
-                value,
-                index
-            )
-            for index, value
-            in enumerate(header)
-        ]
-        if header
-        else
-        [
-            f"column_{i + 1}"
-            for i in range(width)
-        ]
-    )
-
+    data_rows = [row for _, row in data_items]
+    names = [normalize_header(value, index) for index, value in enumerate(header)] if header else [f"column_{i + 1}" for i in range(width)]
     columns = []
-
     for i, name in enumerate(names):
-
-        vals = [
-            r[i]
-            if i < len(r)
-            else ""
-            for r in data_rows[:100]
-        ]
-
+        vals = [r[i] if i < len(r) else "" for r in data_rows[:100]]
+        candidates = semantic_candidates(name, vals) or positional_semantic_candidates(i + 1, vals)
+        for candidate in candidates:
+            candidate["requires_admin_review"] = True
         columns.append({
-
-            "index":
-                i + 1,
-
-            "name":
-                name,
-
-            "inferred_type":
-                infer_field_type(vals),
-
-            "semantic_candidates":
-                (
-                    semantic_candidates(
-                        name,
-                        vals
-                    )
-                    or
-                    positional_semantic_candidates(
-                        i + 1,
-                        vals
-                    )
-                ),
-
-            "non_empty_sample_count":
-                sum(
-                    bool(
-                        str(v).strip()
-                    )
-                    for v in vals
-                ),
-
-            "examples":
-                [
-                    str(v)[:120]
-                    for v in vals
-                    if str(v).strip()
-                ][:3],
+            "index": i + 1,
+            "name": name,
+            "raw_name": header[i] if header and i < len(header) else None,
+            "inferred_type": infer_field_type(vals),
+            "semantic_candidates": candidates,
+            "requires_admin_review": True,
+            "non_empty_sample_count": sum(bool(str(v).strip()) for v in vals),
+            "examples": [str(v) for v in vals if str(v).strip()][:3],
         })
 
-    widths = [
-        len(r)
-        for r in rows
-    ]
+    widths = [len(r) for _, r in parsed_lines]
+    anomalies = sum(1 for w in widths if w != width)
+    row_length_anomalies = [
+        {"row_number": n, "actual_fields": len(r), "expected_fields": width}
+        for n, r in parsed_lines if len(r) != width
+    ][:200]
+    avg_line = sum(len(line.encode("utf-8")) for _, line in nonempty[:100]) / max(1, min(100, len(nonempty)))
+    estimated_rows = int(total_size / avg_line) if total_size and avg_line > 0 else None
 
-    anomalies = sum(
-        1
-        for w in widths
-        if w != width
-    )
-
-    avg_line = (
-        sum(
-            len(
-                x.encode("utf-8")
-            )
-            for x in nonempty[:100]
-        )
-        /
-        max(
-            1,
-            min(
-                100,
-                len(nonempty)
-            )
-        )
-    )
-
-    estimated_rows = (
-        int(
-            total_size / avg_line
-        )
-        if total_size
-        and avg_line > 0
-        else None
-    )
-
-    requires_admin_review = any(
-        c["semantic_candidates"]
-        and
-        c["semantic_candidates"][0]["confidence"]
-        == "low"
-        for c in columns
-    )
-
+    requires_admin_review = True if (not header or ambiguous_header or parse_errors or anomalies or any(c["semantic_candidates"] for c in columns)) else True
     return {
-
-        "status":
-            "analyzed",
-
-        "encoding":
-            encoding,
-
-        "encoding_confidence":
-            enc_conf,
-
-        "delimiter":
-            delimiter or "NONE",
-
-        "delimiter_confidence":
-            delim_conf,
-
-        "column_count":
-            width,
-
-        "header_detected":
-            bool(header),
-
-        "columns":
-            columns,
-
+        "status": "analyzed",
+        "encoding": encoding,
+        "encoding_confidence": enc_conf,
+        "delimiter": delimiter or "NONE",
+        "delimiter_confidence": delim_conf,
+        "column_count": width,
+        "header_detected": bool(header),
+        "header_row_number": header_row_number,
+        "header_candidates": [
+            {k: v for k, v in candidate.items() if k != "row"} | {"raw_values": candidate["row"]}
+            for candidate in header_candidates[:10]
+        ],
+        "ambiguous_header": ambiguous_header,
+        "columns": columns,
         "quality": {
-
-            "sample_lines":
-                len(nonempty),
-
-            "sample_rows_parsed":
-                len(rows),
-
-            "parse_errors":
-                parse_errors,
-
-            "row_length_anomalies_in_sample":
-                anomalies,
-
-            "estimated_total_rows":
-                estimated_rows,
-
-            "estimate_note":
-                "הערכת כמות רשומות לפי גודל הקובץ "
-                "ואורך שורה ממוצע; אינה ספירה מדויקת.",
+            "sample_lines": len(lines),
+            "sample_nonempty_lines": len(nonempty),
+            "sample_rows_parsed": len(parsed_lines),
+            "parse_errors": len(parse_errors),
+            "parse_error_details": parse_errors[:200],
+            "row_length_anomalies_in_sample": anomalies,
+            "row_length_anomaly_details": row_length_anomalies,
+            "preamble_rows_before_header": len(preamble_items),
+            "preamble": [{"row_number": n, "raw_values": row} for n, row in preamble_items[:50]],
+            "estimated_total_rows": estimated_rows,
+            "estimate_note": "הערכת כמות רשומות לפי גודל הקובץ ואורך שורה ממוצע; אינה ספירה מדויקת.",
         },
-
         "sample": {
-
-            "header":
-                [
-                    str(x)[:120]
-                    for x in header
-                ]
-                if header
-                else None,
-
-            "rows":
-                [
-                    [
-                        str(v)[:120]
-                        for v in r
-                    ]
-                    for r in data_rows[:5]
-                ],
+            "header": [str(x) for x in header] if header else None,
+            "header_row_number": header_row_number,
+            "rows": [[str(v) for v in r] for r in data_rows[:5]],
         },
-
-        "requires_admin_review":
-            requires_admin_review,
+        "requires_admin_review": requires_admin_review,
     }
 
 
@@ -2912,7 +2826,9 @@ def analyze_drive_file(
                 downloader.next_chunk()
             )
 
-        raw = buf.getvalue()
+        buf.seek(0)
+        raw = buf.read()
+        buf.close()
 
         if not raw:
 
